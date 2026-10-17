@@ -1,0 +1,5 @@
+build/
+
+# Benchmark image outputs: large and fully regenerable. The CSVs beside them are
+# small, human-readable records and stay tracked.
+results/*.ppm

@@ -1,0 +1,17 @@
+# RCAS strength sweep — how the sharpness control trades detail against PSNR.
+#
+#   ffmpeg -i ~/Pictures/wallhaven-jeeq3q.png -vf scale=1600:1000:flags=lanczos \
+#          -pix_fmt rgb24 /tmp/photo.ppm
+#   lsl-upscale --in /tmp/photo.ppm --render 800x500 --modes fsr1rcas \
+#               --sharpness S --bench 30
+#
+# GTX 1650, 30 iterations. Ground truth is 1600x1000, proxy 800x500, output
+# 1600x1000. Ground-truth edge energy = 3.69 on the 0-255 scale.
+# sharpness is in stops: 0 is AMD's strongest lobe, each whole number halves it.
+# For comparison, plain fsr1 (EASU, no RCAS) is 35.87 dB / 0.9864 / edge 1.81.
+sharpness,psnr_vs_gt,ssim,edge
+0,35.36,0.9852,4.23
+0.5,36.01,0.9870,2.74
+1,36.02,0.9870,2.21
+2,35.95,0.9867,1.89
+4,35.87,0.9864,1.82

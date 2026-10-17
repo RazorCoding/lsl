@@ -1,0 +1,242 @@
+#version 450
+//
+// lsl scale.comp - single-pass spatial upscaler.
+//
+// All modes run from one pipeline, selected by a push constant, so switching
+// scaler at runtime costs no pipeline rebuild. Input and output are tightly
+// packed RGBA8 storage buffers (alpha forced opaque); using buffers rather
+// than storage images keeps Phase 1 free of format/tiling negotiation.
+//
+// Modes: 0 nearest, 1 bilinear, 2 bicubic (Catmull-Rom), 3 Lanczos-2,
+//        4 FSR1 EASU (AMD, MIT - see third_party/ffx/). The full FSR1 chain is
+//        this pass followed by RCAS in shaders/rcas.comp, which lsl-upscale
+//        runs as a second dispatch over a scratch buffer.
+//
+
+// FSR1 is AMD's own source rather than a re-implementation, so the shader and
+// the CPU reference in src/fsr1_ref.cpp compile the identical algorithm and
+// cannot drift apart. A_GLSL selects ffx_a.h's vec2/vec3/vec4 mapping.
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Src { uint src[]; } s_src;
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { uint dst[]; } s_dst;
+
+layout(push_constant) uniform Push {
+    uint srcW;
+    uint srcH;
+    uint dstW;
+    uint dstH;
+    uint mode;
+    float sharpness;  // RCAS strength in stops; read by shaders/rcas.comp, not here
+    uint pad0;
+    uint pad1;
+} p;
+
+// --- grade the source coordinate exactly -----------------------------------
+//
+// The obvious expression
+//
+//     float c = (float(dst) + 0.5) * float(srcSize) / float(dstSize);
+//     int   i = int(floor(c - 0.5));
+//
+// is NOT reproducible: when a destination pixel lands exactly on a texel
+// boundary, a one-ULP difference between the GPU's and the CPU's float
+// evaluation flips `i` by one, which shifts a whole column and destroys
+// nearest's bit-exactness (measured: 29 dB instead of exact at 640x400 ->
+// 1600x1000, i.e. 2.5x). Computing the index in integers makes it exact.
+//
+// With c in source texel space, c = (dst + 0.5) * srcSize / dstSize, and
+// i = floor(c - 0.5). Multiplying through by 2*dstSize:
+//
+//     n = (2*dst + 1) * srcSize - dstSize,  den = 2*dstSize
+//     i = floor(n / den),  f = (n - i*den) / den  in [0,1)
+//
+// and c = i + 0.5 + f, so nearest simply rounds i up when f >= 0.5.
+// Largest intermediate is (2*8192+1) * 8192 ~ 1.3e8, comfortably inside a
+// 32-bit unsigned integer.
+void axisMap(uint d, uint srcSize, uint dstSize,
+             out int base, out float frac, out bool roundUp)
+{
+    const int den = 2 * int(dstSize);
+    const int n   = int((2u * d + 1u) * srcSize) - int(dstSize);
+
+    // floor division that is correct for negative n too (downscaling)
+    base = (n >= 0) ? (n / den) : -(((-n) + den - 1) / den);
+
+    const int rem = n - base * den;      // always in [0, den)
+    frac    = float(rem) / float(den);
+    roundUp = (2 * rem) >= den;          // exact test for frac >= 0.5
+}
+
+// --- kernels are declared before use (GLSL has no use-before-declaration) ---
+
+float sinc(float x)
+{
+    x = abs(x);
+    return (x < 1.0e-5) ? 1.0 : (sin(3.14159265358979323846 * x)
+                                 / (3.14159265358979323846 * x));
+}
+
+// Lanczos-2 kernel: L(x) = sinc(x) * sinc(x/2), zero beyond |x| >= 2
+float lanczos2Weight(float x)
+{
+    x = abs(x);
+    if (x >= 2.0) return 0.0;
+    return sinc(x * 0.5) * sinc(x);
+}
+
+// Mitchell-Netravali cubic. B = 0, C = 0.5 is exactly Catmull-Rom:
+//   |x|<1 : 1.5|x|^3 - 2.5|x|^2 + 1
+//   |x|<2 : -0.5|x|^3 + 2.5|x|^2 - 4|x| + 2
+// (B = C = 0.5 would be a valid, but distinctly blurrier, filter.)
+float cubicWeight(float x)
+{
+    const float B = 0.0;
+    const float C = 0.5;
+    x  = abs(x);
+    float x2 = x * x;
+    float x3 = x2 * x;
+    if (x <= 1.0)
+        return ((12.0 - 9.0 * B - 6.0 * C) * x3
+              + (-18.0 + 12.0 * B + 6.0 * C) * x2
+              + (6.0 - 2.0 * B)) / 6.0;
+    if (x < 2.0)
+        return ((-B - 6.0 * C) * x3
+              + (6.0 * B + 30.0 * C) * x2
+              + (-12.0 * B - 48.0 * C) * x
+              + (8.0 * B + 24.0 * C)) / 6.0;
+    return 0.0;
+}
+
+// --- source access ---------------------------------------------------------
+
+vec3 fetch(int x, int y)
+{
+    x = clamp(x, 0, int(p.srcW) - 1);
+    y = clamp(y, 0, int(p.srcH) - 1);
+    uint packed = s_src.src[uint(y) * p.srcW + uint(x)];
+    return vec3(float(packed & 0xffu),
+                float((packed >> 8) & 0xffu),
+                float((packed >> 16) & 0xffu));
+}
+
+uint pack(vec3 v)
+{
+    uvec3 c = clamp(uvec3(round(v)), uvec3(0u), uvec3(255u));
+    return c.r | (c.g << 8) | (c.b << 16) | 0xff000000u;
+}
+
+// --- FSR1 EASU gather taps ------------------------------------------------
+//
+// EASU reads its 12 taps through textureGather. Phase 1 works in storage
+// buffers rather than sampled images, so the same 2x2 gather is emulated here.
+// The component order must match the API's:
+//
+//     .x = (i0, j0+1)   .y = (i0+1, j0+1)   .z = (i0+1, j0)   .w = (i0, j0)
+//
+// Getting that order wrong still produces a plausible-looking image, so the
+// 1:1 passthrough test in tests/test_reference.cpp pins it down.
+float fetch01(int x, int y, int c)
+{
+    x = clamp(x, 0, int(p.srcW) - 1);
+    y = clamp(y, 0, int(p.srcH) - 1);
+    uint packed = s_src.src[uint(y) * p.srcW + uint(x)];
+    return float((packed >> uint(8 * c)) & 0xffu) * (1.0 / 255.0);
+}
+
+AF4 gather01(AF2 q, int c)
+{
+    int i0 = int(floor(q.x * float(p.srcW) - 0.5));
+    int j0 = int(floor(q.y * float(p.srcH) - 0.5));
+    return AF4(fetch01(i0,     j0 + 1, c),
+               fetch01(i0 + 1, j0 + 1, c),
+               fetch01(i0 + 1, j0,     c),
+               fetch01(i0,     j0,     c));
+}
+
+AF4 FsrEasuRF(AF2 q) { return gather01(q, 0); }
+AF4 FsrEasuGF(AF2 q) { return gather01(q, 1); }
+AF4 FsrEasuBF(AF2 q) { return gather01(q, 2); }
+
+#define FSR_EASU_F 1
+#include "ffx_fsr1.h"
+
+// --- scalers ---------------------------------------------------------------
+// `base` is the source texel at or left/above the sample; `frac` in [0,1) is
+// the distance from that texel to the sample point.
+
+vec3 scaleBilinear(int bx, int by, float fx, float fy)
+{
+    vec3 a = mix(fetch(bx,     by),     fetch(bx + 1, by),     fx);
+    vec3 b = mix(fetch(bx,     by + 1), fetch(bx + 1, by + 1), fx);
+    return mix(a, b, fy);
+}
+
+vec3 scaleCubic(int bx, int by, float fx, float fy)
+{
+    vec3 acc = vec3(0.0);
+    for (int j = -1; j <= 2; ++j)
+    {
+        float wy = cubicWeight(fy - float(j));
+        for (int k = -1; k <= 2; ++k)
+        {
+            float w = wy * cubicWeight(fx - float(k));
+            acc += fetch(bx + k, by + j) * w;
+        }
+    }
+    return acc;
+}
+
+vec3 scaleLanczos2(int bx, int by, float fx, float fy)
+{
+    vec3  acc  = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = -1; j <= 2; ++j)
+    {
+        float wy = lanczos2Weight(fy - float(j));
+        for (int k = -1; k <= 2; ++k)
+        {
+            float w = wy * lanczos2Weight(fx - float(k));
+            acc  += fetch(bx + k, by + j) * w;
+            wsum += w;
+        }
+    }
+    return (abs(wsum) > 1.0e-6) ? acc / wsum : acc;
+}
+
+// --- entry -----------------------------------------------------------------
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= p.dstW || gid.y >= p.dstH) return;
+
+    int   bx, by;
+    float fx, fy;
+    bool  rx, ry;
+    axisMap(gid.x, p.srcW, p.dstW, bx, fx, rx);
+    axisMap(gid.y, p.srcH, p.dstH, by, fy, ry);
+
+    vec3 v;
+    if      (p.mode == 0u) v = fetch(bx + (rx ? 1 : 0), by + (ry ? 1 : 0));
+    else if (p.mode == 1u) v = scaleBilinear(bx, by, fx, fy);
+    else if (p.mode == 2u) v = scaleCubic(bx, by, fx, fy);
+    else if (p.mode == 3u) v = scaleLanczos2(bx, by, fx, fy);
+    else
+    {
+        AU4 con0, con1, con2, con3;
+        FsrEasuCon(con0, con1, con2, con3,
+                   float(p.srcW), float(p.srcH),
+                   float(p.srcW), float(p.srcH),
+                   float(p.dstW), float(p.dstH));
+        AF3 c;
+        FsrEasuF(c, AU2(gid.x, gid.y), con0, con1, con2, con3);
+        v = clamp(c, 0.0, 1.0) * 255.0;
+    }
+
+    s_dst.dst[gid.y * p.dstW + gid.x] = pack(v);
+}

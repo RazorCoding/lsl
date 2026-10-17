@@ -1,0 +1,75 @@
+#version 450
+//
+// lsl rcas.comp - RCAS, the contrast-adaptive sharpening pass that follows EASU
+// in FSR1.
+//
+// Runs over the EASU output at the same resolution, reading and writing the same
+// tightly packed RGBA8 storage-buffer layout as shaders/scale.comp. Like
+// scale.comp it includes AMD's original ffx_fsr1.h (MIT - see third_party/ffx/),
+// so this is the real algorithm rather than a lookalike.
+//
+// The pass is deliberately separate from EASU: RCAS is a 3x3 cross operator, so
+// every output pixel needs its four neighbours' EASU results, which no single
+// dispatch can provide. lsl-upscale therefore runs EASU into a scratch buffer
+// and then this pass over it.
+//
+// sharpness is in stops: 0.0 is the maximum lobe RCAS will apply (internally
+// capped at FSR_RCAS_LIMIT), and each whole number halves it.
+//
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std430) readonly  buffer Src { uint src[]; } s_src;
+layout(set = 0, binding = 1, std430) writeonly buffer Dst { uint dst[]; } s_dst;
+
+layout(push_constant) uniform Push {
+    uint  srcW;       // equals dstW of the EASU pass that filled the input
+    uint  srcH;
+    uint  dstW;
+    uint  dstH;
+    uint  mode;       // unused here; kept so both shaders share one Push block
+    float sharpness;
+    uint  pad0;
+    uint  pad1;
+} p;
+
+#define FSR_RCAS_F 1
+#include "ffx_fsr1.h"
+
+// --- callbacks the header declares (it works in [0,1] floats) --------------
+
+AF4 FsrRcasLoadF(ASU2 q)
+{
+    const int x = clamp(q.x, 0, int(p.srcW) - 1);
+    const int y = clamp(q.y, 0, int(p.srcH) - 1);
+    const uint packed = s_src.src[uint(y) * p.srcW + uint(x)];
+    const vec3 rgb = vec3(float(packed & 0xffu),
+                          float((packed >> 8) & 0xffu),
+                          float((packed >> 16) & 0xffu)) * (1.0 / 255.0);
+    return AF4(rgb, 1.0);
+}
+
+// RCAS's optional hook for colour-space conversion before sharpening. The
+// pipeline works in sRGB-encoded values throughout, so there is nothing to do.
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) { }
+
+void main()
+{
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= p.dstW || gid.y >= p.dstH) return;
+
+    // Same constant generation as the CPU reference in src/fsr1_ref.cpp.
+    AU4 con;
+    FsrRcasCon(con, p.sharpness);
+
+    AF1 r, g, b;
+    FsrRcasF(r, g, b, AU2(gid.x, gid.y), con);
+
+    const vec3 v = clamp(vec3(r, g, b), 0.0, 1.0) * 255.0;
+    const uvec3 c = clamp(uvec3(round(v)), uvec3(0u), uvec3(255u));
+    s_dst.dst[gid.y * p.dstW + gid.x] = c.r | (c.g << 8) | (c.b << 16) | 0xff000000u;
+}
