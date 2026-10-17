@@ -112,13 +112,60 @@ float cubicWeight(float x)
     return 0.0;
 }
 
-// --- source access ---------------------------------------------------------
+// --- pixel I/O -------------------------------------------------------------
+//
+// The default layout is tightly packed RGBA8, one uint per pixel, which is what
+// src/fsr1_ref.cpp and the Phase 1 harness assume. Compiling with -DLSL_IO_16F
+// switches to four half floats per pixel (two uints), which is what a
+// VK_FORMAT_R16G16B16A16_SFLOAT swapchain holds. Only the load and store
+// change: every kernel above and below still sees [0,255] values, so the two
+// variants cannot disagree about the math, only about the packing.
+//
+// shaders/rcas.comp carries the same two variants and must use the same one.
+
+#ifdef LSL_IO_16F
+
+uint ioIndex(uint x, uint y, uint w) { return 2u * (y * w + x); }
 
 vec3 fetch(int x, int y)
 {
     x = clamp(x, 0, int(p.srcW) - 1);
     y = clamp(y, 0, int(p.srcH) - 1);
-    uint packed = s_src.src[uint(y) * p.srcW + uint(x)];
+    const uint i = ioIndex(uint(x), uint(y), p.srcW);
+    return vec3(unpackHalf2x16(s_src.src[i]),
+                unpackHalf2x16(s_src.src[i + 1u]).x) * 255.0;
+}
+
+// Values come back in [0,1] and are clamped there: the rest of the pipeline has
+// no HDR headroom, so an HDR swapchain would clip rather than bloom.
+float fetch01(int x, int y, int c)
+{
+    x = clamp(x, 0, int(p.srcW) - 1);
+    y = clamp(y, 0, int(p.srcH) - 1);
+    const uint i = ioIndex(uint(x), uint(y), p.srcW);
+    const vec2 lo = unpackHalf2x16(s_src.src[i]);
+    const vec2 hi = unpackHalf2x16(s_src.src[i + 1u]);
+    const float v = (c == 0) ? lo.x : ((c == 1) ? lo.y : hi.x);
+    return clamp(v, 0.0, 1.0);
+}
+
+// Alpha is forced opaque, exactly as the RGBA8 path does.
+void storePixel(uint i, vec3 v)
+{
+    const vec3 n = clamp(v, 0.0, 255.0) * (1.0 / 255.0);
+    s_dst.dst[i]      = packHalf2x16(n.rg);
+    s_dst.dst[i + 1u] = packHalf2x16(vec2(n.b, 1.0));
+}
+
+#else
+
+uint ioIndex(uint x, uint y, uint w) { return y * w + x; }
+
+vec3 fetch(int x, int y)
+{
+    x = clamp(x, 0, int(p.srcW) - 1);
+    y = clamp(y, 0, int(p.srcH) - 1);
+    uint packed = s_src.src[ioIndex(uint(x), uint(y), p.srcW)];
     return vec3(float(packed & 0xffu),
                 float((packed >> 8) & 0xffu),
                 float((packed >> 16) & 0xffu));
@@ -130,6 +177,18 @@ uint pack(vec3 v)
     return c.r | (c.g << 8) | (c.b << 16) | 0xff000000u;
 }
 
+float fetch01(int x, int y, int c)
+{
+    x = clamp(x, 0, int(p.srcW) - 1);
+    y = clamp(y, 0, int(p.srcH) - 1);
+    uint packed = s_src.src[ioIndex(uint(x), uint(y), p.srcW)];
+    return float((packed >> uint(8 * c)) & 0xffu) * (1.0 / 255.0);
+}
+
+void storePixel(uint i, vec3 v) { s_dst.dst[i] = pack(v); }
+
+#endif
+
 // --- FSR1 EASU gather taps ------------------------------------------------
 //
 // EASU reads its 12 taps through textureGather. Phase 1 works in storage
@@ -140,13 +199,6 @@ uint pack(vec3 v)
 //
 // Getting that order wrong still produces a plausible-looking image, so the
 // 1:1 passthrough test in tests/test_reference.cpp pins it down.
-float fetch01(int x, int y, int c)
-{
-    x = clamp(x, 0, int(p.srcW) - 1);
-    y = clamp(y, 0, int(p.srcH) - 1);
-    uint packed = s_src.src[uint(y) * p.srcW + uint(x)];
-    return float((packed >> uint(8 * c)) & 0xffu) * (1.0 / 255.0);
-}
 
 AF4 gather01(AF2 q, int c)
 {
@@ -238,5 +290,5 @@ void main()
         v = clamp(c, 0.0, 1.0) * 255.0;
     }
 
-    s_dst.dst[gid.y * p.dstW + gid.x] = pack(v);
+    storePixel(ioIndex(gid.x, gid.y, p.dstW), v);
 }

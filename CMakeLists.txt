@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(lsl LANGUAGES CXX)
+# C for the layer (it must load into arbitrary processes, so no C++ runtime
+# dependency), C++ for everything else.
+project(lsl LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,10 +30,24 @@ foreach(NAME scale rcas)
   add_custom_command(
     OUTPUT ${SPV}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${LSL_SPV_DIR}
-    COMMAND ${GLSLC} --target-env=vulkan1.2 -O -I ${LSL_FFX_DIR} -o ${SPV} ${SRC}
+    COMMAND ${GLSLC} --target-env=vulkan1.0 -O -I ${LSL_FFX_DIR} -o ${SPV} ${SRC}
     DEPENDS ${SRC} ${LSL_FFX_DIR}/ffx_a.h ${LSL_FFX_DIR}/ffx_fsr1.h
     COMMENT "SPIR-V: ${NAME}.comp")
   list(APPEND LSL_SPV ${SPV})
+
+  # Same source, half-float pixel I/O. A VK_FORMAT_R16G16B16A16_SFLOAT
+  # swapchain -- which is what vkcube gets on this host's Wayland session, and
+  # what an HDR game would get -- stores four half floats per pixel rather than
+  # a packed RGBA8 word, so the layer needs both flavours. Only load/store
+  # differs; every filter is the same code.
+  set(SPV16 ${LSL_SPV_DIR}/${NAME}16.comp.spv)
+  add_custom_command(
+    OUTPUT ${SPV16}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${LSL_SPV_DIR}
+    COMMAND ${GLSLC} --target-env=vulkan1.0 -O -DLSL_IO_16F -I ${LSL_FFX_DIR} -o ${SPV16} ${SRC}
+    DEPENDS ${SRC} ${LSL_FFX_DIR}/ffx_a.h ${LSL_FFX_DIR}/ffx_fsr1.h
+    COMMENT "SPIR-V: ${NAME}.comp (16F I/O)")
+  list(APPEND LSL_SPV ${SPV16})
 endforeach()
 
 set(LSL_BLOB ${CMAKE_CURRENT_BINARY_DIR}/spv_blob.cpp)
@@ -42,7 +58,19 @@ add_custom_command(
   DEPENDS ${LSL_SPV} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py
   COMMENT "embedding SPIR-V blobs")
 
+# The C++ blob above is what lsl-upscale and lsl-tests link. The layer is C and
+# must not drag in a C++ runtime, so it gets the same blobs through a C header.
+set(LSL_BLOB_C ${CMAKE_CURRENT_BINARY_DIR}/spv_blob_c.c)
+set(LSL_BLOB_C_H ${CMAKE_CURRENT_BINARY_DIR}/spv_blob_c.h)
+add_custom_command(
+  OUTPUT ${LSL_BLOB_C} ${LSL_BLOB_C_H}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py
+          --lang c ${LSL_SPV_DIR} ${LSL_BLOB_C} ${LSL_BLOB_C_H}
+  DEPENDS ${LSL_SPV} ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_spv.py
+  COMMENT "embedding SPIR-V blobs (C)")
+
 add_custom_target(lsl_shaders DEPENDS ${LSL_SPV} ${LSL_BLOB})
+add_custom_target(lsl_shaders_c DEPENDS ${LSL_BLOB_C})
 
 # ---------------------------------------------------------------------------
 # FSR1 reference header
@@ -95,6 +123,50 @@ target_link_libraries(lsl-upscale PRIVATE lsl_core)
 add_executable(lsl-tests   tests/test_reference.cpp)
 target_link_libraries(lsl-tests PRIVATE lsl_core)
 
+# ---------------------------------------------------------------------------
+# Phase 2: the frame-injection layer
+#
+# A Vulkan layer, not a program: the loader injects it into the instance and
+# device chain, which is what makes a game patchable without cooperating.
+#
+# It observes vkQueuePresentKHR always; with LSL_LAYER_CAPTURE=1 it also reads
+# the presented image back; with LSL_LAYER_SCALE=<n> it lies to the app about
+# the surface size and upscales the smaller frame it renders back to full
+# resolution with the Phase 1 FSR1 chain.
+# ---------------------------------------------------------------------------
+add_library(lsl-layer SHARED layer/lsl_layer.c layer/lsl_upscale.c ${LSL_BLOB_C})
+target_link_libraries(lsl-layer PRIVATE Vulkan::Vulkan)
+# -g unconditionally: when this layer misbehaves, the only useful evidence is a
+# core dump, and a backtrace without line numbers costs far more than the
+# symbols do.
+target_compile_options(lsl-layer PRIVATE -Wall -Wextra -g)
+target_include_directories(lsl-layer PRIVATE ${VULKAN_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
+
+# The manifest has to carry an absolute library_path: the loader does not
+# resolve it relative to the manifest, which is exactly the reason the
+# system-installed lsfg-vk layer never loads on this host (see README).
+set(LSL_LAYER_DIR ${CMAKE_CURRENT_BINARY_DIR}/layer)
+file(MAKE_DIRECTORY ${LSL_LAYER_DIR})
+file(GENERATE
+     OUTPUT ${LSL_LAYER_DIR}/VkLayer_lsl_frame.json
+     CONTENT
+"{
+    \"file_format_version\": \"1.0.0\",
+    \"layer\": {
+        \"name\": \"VK_LAYER_LSL_frame\",
+        \"type\": \"GLOBAL\",
+        \"library_path\": \"$<TARGET_FILE:lsl-layer>\",
+        \"api_version\": \"1.3.0\",
+        \"implementation_version\": \"1\",
+        \"description\": \"lsl frame injection (Phase 2 prototype)\",
+        \"functions\": {
+            \"vkGetInstanceProcAddr\": \"vkGetInstanceProcAddr\",
+            \"vkGetDeviceProcAddr\": \"vkGetDeviceProcAddr\"
+        }
+    }
+}
+")
+
 enable_testing()
 add_test(NAME reference COMMAND lsl-tests)
 
@@ -105,3 +177,13 @@ add_test(NAME validation
                  $<TARGET_FILE:lsl-upscale>
                  --make-test 320x200 --dst 800x500 --bench 2
                  --modes nearest,bilinear,cubic,lanczos2,fsr1,fsr1rcas)
+
+# End to end: vkcube runs with the layer injected (LSL_LAYER_SCALE=2), the layer
+# dumps the frame it upscaled at present time, and the same source is fed to
+# lsl-upscale and compared -- exactly, for 8-bit swapchains.  This is the test
+# that says the layer really upscales, rather than that it links.  It opens a
+# window, so it skips (77) without a session.
+add_test(NAME layer-upscale
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/upscale-check.sh
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(layer-upscale PROPERTIES SKIP_RETURN_CODE 77)

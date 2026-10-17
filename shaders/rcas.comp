@@ -40,17 +40,33 @@ layout(push_constant) uniform Push {
 #define FSR_RCAS_F 1
 #include "ffx_fsr1.h"
 
+// --- shared pixel I/O ------------------------------------------------------
+//
+// Same two layouts as shaders/scale.comp, selected by the same -DLSL_IO_16F, so
+// EASU's output and RCAS's input always agree about the buffer they share.
+
+#ifdef LSL_IO_16F
+uint ioIndex(uint x, uint y, uint w) { return 2u * (y * w + x); }
+#endif
+
 // --- callbacks the header declares (it works in [0,1] floats) --------------
 
 AF4 FsrRcasLoadF(ASU2 q)
 {
     const int x = clamp(q.x, 0, int(p.srcW) - 1);
     const int y = clamp(q.y, 0, int(p.srcH) - 1);
+#ifdef LSL_IO_16F
+    const uint i = ioIndex(uint(x), uint(y), p.srcW);
+    const vec2 lo = unpackHalf2x16(s_src.src[i]);
+    const vec2 hi = unpackHalf2x16(s_src.src[i + 1u]);
+    return AF4(vec3(lo.x, lo.y, hi.x), 1.0);
+#else
     const uint packed = s_src.src[uint(y) * p.srcW + uint(x)];
     const vec3 rgb = vec3(float(packed & 0xffu),
                           float((packed >> 8) & 0xffu),
                           float((packed >> 16) & 0xffu)) * (1.0 / 255.0);
     return AF4(rgb, 1.0);
+#endif
 }
 
 // RCAS's optional hook for colour-space conversion before sharpening. The
@@ -70,6 +86,13 @@ void main()
     FsrRcasF(r, g, b, AU2(gid.x, gid.y), con);
 
     const vec3 v = clamp(vec3(r, g, b), 0.0, 1.0) * 255.0;
+#ifdef LSL_IO_16F
+    const uint i = ioIndex(gid.x, gid.y, p.dstW);
+    const vec3 n = v * (1.0 / 255.0);
+    s_dst.dst[i]      = packHalf2x16(n.rg);
+    s_dst.dst[i + 1u] = packHalf2x16(vec2(n.b, 1.0));
+#else
     const uvec3 c = clamp(uvec3(round(v)), uvec3(0u), uvec3(255u));
     s_dst.dst[gid.y * p.dstW + gid.x] = c.r | (c.g << 8) | (c.b << 16) | 0xff000000u;
+#endif
 }

@@ -4,9 +4,11 @@ A from-scratch Vulkan compute upscaler for games running under Steam/Proton on
 Wayland (CachyOS/Arch + Hyprland). No code, binaries, or models are taken from
 Lossless Scaling or from `lsfg-vk`.
 
-**Current state: Phase 1 only — a headless scaler core and a per-GPU
-benchmark.** There is no layer, no game injection, and no frame generation yet.
-Nothing here touches a running game.
+**Current state: Phase 1 and the Phase 2 layer.** Phase 1 is the scaler core and
+its benchmark; Phase 2 is a Vulkan layer that makes a running application render
+at a fraction of the surface size and upscales the frame at present time with
+that same chain. There is no GUI, no profile management and no frame generation
+yet; the layer is injected per game by hand.
 
 ---
 
@@ -24,9 +26,12 @@ Nothing here touches a running game.
 | `src/probe.cpp` | `lsl-probe`: Vulkan device inventory + env traps |
 | `src/upscale.cpp` | `lsl-upscale`: fidelity *and* quality benchmark |
 | `tests/test_reference.cpp` | 79 CPU-reference checks |
+| `layer/lsl_layer.c` | the Vulkan layer: swapchain capture, the size lie, present interception |
+| `layer/lsl_upscale.c` | the in-layer FSR1 EASU→RCAS present engine, plus PPM dumps |
 | Validation layers | installable per-user without root; wired into `ctest` |
 | FSR1 `balanced` tier | EASU upscaling **and** RCAS sharpening, both landed |
-| Frame capture / layer injection | **not implemented** |
+| Frame capture / layer injection | **done** — `LSL_LAYER_CAPTURE`, `LSL_LAYER_SCALE` |
+| Present-time upscaling | **done** — render at 1/scale, FSR1 back to full size |
 | Motion estimation / frame generation | **not implemented** |
 | GUI, profiles, packaging | **not implemented** |
 
@@ -40,21 +45,190 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-CTest runs 79 CPU reference checks plus a `validation` test that re-runs the
-scaler under the Khronos validation layers. That test **skips itself** unless
-the layers are installed:
+CTest runs three tests: the 79 CPU reference checks (`reference`), a `validation`
+test that re-runs the scaler under the Khronos validation layers, and
+`layer-upscale`, which loads the layer into `vkcube` and checks its present-time
+result against the Phase 1 reference (see *Verifying the layer* below). The
+validation-dependent halves **skip themselves** unless the layers are installed:
 
 ```sh
 tools/setup-validation-layers.sh     # per-user, no root, ~15 MB
 ```
 
 Requires: a C++20 compiler, CMake ≥ 3.20, Ninja, `glslc`, Vulkan headers+loader,
-Python 3. `libplacebo` is deliberately *not* a dependency.
+Python 3, and `vkcube` (`vulkan-tools`) for the layer test; `libplacebo` is
+deliberately *not* a dependency.
 
-## Run
+---
+
+## Phase 2 — the layer
+
+`build/layer/liblsl-layer.so` does the whole thing inside a running application.
+It is injected through the Steam launch options (the GUI that writes these does
+not exist yet, so this is the manual form):
 
 ```sh
-./build/lsl-probe                    # what does this process actually see?
+VK_ADD_LAYER_PATH=/home/you/Code/lsl/build/layer \
+VK_INSTANCE_LAYERS=VK_LAYER_LSL_frame \
+LSL_LAYER_SCALE=2 %command%
+```
+
+Unset `LSL_LAYER_SCALE` (or set it to `1`) and the layer loads but does nothing,
+so the rest of the line can stay while scaling is off.
+
+| Variable | Meaning |
+| --- | --- |
+| `LSL_LAYER_SCALE` | upscale factor, `2` = render at half size. Unset/`≤1` = off. Fractional values work (`1.5`, `2.5`); the app is told `trunc(real/scale)` |
+| `LSL_LAYER_SHARPNESS` | RCAS strength in stops, as in `lsl-upscale` (default 0 = AMD's setting) |
+| `LSL_LAYER_DUMP` | prefix; writes `<prefix>.src.ppm`, `.out.ppm`, `.easu.ppm` for the **first** upscaled frame |
+| `LSL_LAYER_LOG` | where the layer's one-line-per-event log goes (nothing is logged without it) |
+| `LSL_LAYER_CAPTURE` | `1` = the Phase-1-style readback path (hash per frame), slow by design |
+| `LSL_LAYER_CAPTURE_FRAMES` | stop capturing after N frames (default 12, `0` = no limit) |
+| `LSL_LAYER_BREAK_LAYOUT` | test-only: leave the image in the wrong layout, to prove validation is really looking at the layer |
+
+### How the lie works
+
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR` is the only place an application
+learns what size its surface is. The layer reports a smaller `currentExtent`
+(with a matching `minImageExtent`, since the spec requires
+`min ≤ current ≤ max`) and leaves `maxImageExtent` alone. The application then
+builds a smaller swapchain and renders into it — but the swapchain that is
+*created* is still the surface's real size, because the lie is only in what is
+handed back to the app, not in what goes down to the driver.
+
+The app's `WxH` image therefore lands in the top-left `WxH` corner of the real
+`NxM` image. At present time the layer:
+
+1. copies that corner into a device-local buffer,
+2. runs EASU from `WxH` to `NxM` into the scratch plane,
+3. runs RCAS into the destination plane,
+4. copies the full image back over the presented image,
+5. barriers the image to `PRESENT_SRC_KHR` and lets the present through.
+
+There is no CPU wait on the present path: one queue, in-order submits, no fence
+read. The only stall anywhere is the readback for `LSL_LAYER_DUMP`.
+
+`maxImageExtent` is left alone on purpose: an app that ignores `currentExtent`
+and asks for the full size just gets no upscaling rather than a broken
+swapchain. Leaving the app's `oldSwapchain` path alone means a resize simply
+re-lies and rebuilds.
+
+**Native Wayland has no fixed `currentExtent`** (the driver reports
+`UINT32_MAX`), so there is nothing to shrink on the first query. There the layer
+lets the first swapchain through at full size, learns the surface size from it,
+and lies from the second one on — so the first frame is full size and later ones
+are not. XWayland (and X11 generally) names the size outright and is upscaled
+from the first frame.
+
+### Formats
+
+Only formats the shader family can read and write are used:
+`R8G8B8A8_*`/`B8G8R8A8_*` (`_UNORM`/`_SRGB`, `lsl-upscale` drives the `fsr1rcas`
+mode) and `R16G16B16A16_SFLOAT`, which pulls a second SPIR-V variant compiled
+with `-DLSL_IO_16F`. The 16-bit variant is what Wayland's compositor normally
+hands out; XWayland usually gives an 8-bit one. Anything else logs which format
+it saw and leaves the application at full size. Both shaders are compiled with
+`--target-env=vulkan1.0`, because the layer loads into applications that may not
+advertise anything newer.
+
+### Verifying the layer
+
+`tools/upscale-check.sh` turns "the picture looks sharper" into a number. It
+runs `vkcube` with the layer loaded, and the layer dumps the source and the
+output of the first upscaled frame. The dumped source is fed through the Phase 1
+command-line upscaler — the same shaders, compiled from the same source — and
+the two images are compared:
+
+```
+$ ./tools/upscale-check.sh build
+self-test: one capture pass with a deliberate wrong layout, which validation must report
+self-test: ok -- the validation layer sees the layer's commands
+running: vkcube --wsi xcb --c 5, scale 2, validation layers
+upscale: 635x775 -> 1271x1551, format 44, 8-bit pixels
+note: BGRA swapchain; comparing in the shader's channel order
+  differing bytes  : 0/5913963
+  max channel delta: 0
+  PSNR             : inf
+validation: the layer's commands were validated, nothing reported
+PASS: present-time upscale matches the Phase 1 reference
+```
+
+* 8-bit swapchains must match **byte for byte**. A BGRA swapchain reaches the
+  shader with R and B exchanged relative to the dump's human-readable order, so
+  the comparison is done in the shader's channel order.
+* 16-bit swapchains are gated on PSNR instead (55.2 dB on Wayland), because the
+  dump is 8-bit and the reference therefore works from quantised input.
+* When the validation layers are installed they are loaded *underneath* the
+  injected layer for the same run, so the commands the layer records are
+  validated too, and the pass requires both a matching image and zero validation
+  messages. `LSL_CHECK_VVL=0` skips that half; `LSL_VVL_DIR` points at the
+  manifest.
+* Before the clean run, `LSL_LAYER_BREAK_LAYOUT=1` runs one short capture pass
+  with the image deliberately left in the wrong layout at present. That must be
+  reported (`VUID-VkPresentInfoKHR-pImageIndices-01430`); if it is not, a clean
+  pass would only mean validation is not looking at the layer at all.
+  `LSL_CHECK_SELFTEST=0` skips it. This is the same trick
+  `tools/validation-check.sh` uses on the Phase 1 scaler, where the thing being
+  asserted on cannot prove its own absence.
+
+The same script runs for the native Wayland path with `LSL_CHECK_WSI=wayland`.
+`ctest` runs the XCB form as `layer-upscale`.
+
+### Layer limits (prototype)
+
+* **One device at a time.** The upscale engine holds one device: a swapchain on
+  a second live device tears the engine down and rebuilds it there, so two
+  devices presenting at once would thrash rather than corrupt (the layer logs
+  the rebuild). The capture path and the engine both resolve their entry points
+  per device, because in a two-device process the *last* device's objects are
+  not interchangeable with the first's. (Two *instances* are normal — several
+  implicit layers create their own.)
+* **One present queue family.** If the present queue is not from the family the
+  upscale runs on, the correct fix is a queue family ownership transfer, which
+  the prototype does not do, so it declines instead.
+* **Formats** are the three listed above; anything else disables scaling for
+  that application.
+
+### Three bugs this phase found with the validation layers underneath
+
+All three were invisible without VVL below the layer, and they are recorded
+because they are exactly the class of bug the Phase 1 gates could not see:
+
+1. **The layer's own command buffers were invisible to validation.** The loader
+   stamps every command buffer it hands the application with the device dispatch
+   word (`loader_set_dispatch`), and VVL resolves a command buffer's device
+   through that word. A layer that allocates its own through the next-chain
+   entry point bypasses the loader's trampoline, so the word stays whatever the
+   driver left there and VVL aborts with *"The VkDevice dispatch handle was not
+   found"* — a crash, with zero VUIDs, before any of the layer's commands were
+   even looked at. `lsl_stamp_command_buffers()` writes the same word the loader
+   would have written (`*cb = *dev`).
+2. **Two instances, one dispatch.** An instance-level call has to be dispatched
+   through the instance its arguments came from. `pick_queue_family()` resolved
+   `vkGetPhysicalDeviceQueueFamilyProperties`/`…SurfaceSupportKHR` through
+   whichever instance was created last, which on this host is another implicit
+   layer's — so the surface in the call belonged to a different instance than the
+   command. Three validation errors (`…-commonparent`, `ExtensionNotEnabled`,
+   and a "Couldn't find VkSurfaceKHR" from the loader), only on the Wayland path
+   because that is the path where the second instance had a surface. The engine
+   now resolves through the instance that owns the device's physical device
+   (`lsl_pd_proc`).
+3. **Two devices, one dispatch table.** The capture path kept one global
+   function table and device handle — whichever device was created last — while
+   using the *swapchain's* image and queue. With one device that is invisible;
+   with two it is `VUID-vkCmdCopyImageToBuffer-commonparent` and friends. The
+   upscale engine already kept a table per device for exactly this reason; the
+   capture path, which predates it, did not. It now resolves per device, rebuilds
+   its objects when the device changes, and `vkDestroyDevice` only tears down the
+   objects of the device going away.
+
+None of them is a wrong *picture* — they are exactly the kind of thing that
+would have shipped as "works on my machine" without the validation layer sitting
+in the right place.
+
+---
+
+## Run: the Phase 1 tools
 
 # fidelity, self-contained: synthetic 1600x1000 -> 2560x1600, writes the CSV
 ./build/lsl-upscale --make-test 1600x1000 --dst 2560x1600 \
@@ -423,6 +597,16 @@ CTest (`tools/setup-validation-layers.sh`, `tools/validation-check.sh`). It
 reports zero errors on both GPUs for all six modes, and on this increment it
 earned its keep by catching bug 10 above.
 
+It also validates the layer's own commands, as long as it is loaded
+*underneath* the injected layer rather than over it: the injected layer has to
+be closest to the application for the validation layer to see what it records.
+`tools/upscale-check.sh` runs that configuration and requires zero messages
+alongside the byte-exact image comparison; it found the three Phase 2 bugs
+listed earlier. Before the clean pass it runs `LSL_LAYER_BREAK_LAYOUT=1` once —
+the layout left wrong at present, which must be reported as
+`VUID-VkPresentInfoKHR-pImageIndices-01430` — so "the layer is clean under
+validation" cannot be confused with "validation never looked at the layer".
+
 Getting it to run at all took three separate traps, all recorded in the scripts:
 
 * **`pacman` needs root**, so the official Arch package is downloaded and
@@ -513,12 +697,35 @@ and review — not on the layer.
    changed the answer: the setting is `VK_LAYER_VALIDATE_SYNC=1`, and this VVL
    does not report compute/shader-storage hazards (issues 6061, 6096), so Phase
    2 cannot lean on the layer to check its barriers.
-6. Then move to the Phase 2 question: how a layer gets a compute pass between the
-   game's render target and `vkQueuePresentKHR` without disturbing Hyprland.
+6. ~~How does a layer get a compute pass between a game's render target and
+   `vkQueuePresentKHR`?~~ — **answered and built**, see *Phase 2* above: the
+   surface-size lie, a real-size swapchain, and EASU→RCAS on the present queue,
+   byte-exact against the Phase 1 reference and clean under validation on both
+   XWayland and native Wayland.
+7. **Next.** In rough order:
+   * **Phase 0 gate, still manual.** Run a real game once with
+     `DXVK_HUD=devinfo,fps %command%` plus the layer line, and confirm it renders
+     small, upscales, and picks the GPU Proton expects. Everything so far is
+     `vkcube`; a Proton process is the point of the exercise.
+   * **The swapchain under stress.** `oldSwapchain` reuse, resize storms,
+     `VK_ERROR_OUT_OF_DATE_KHR` / `VK_SUBOPTIMAL_KHR` handling, and what happens
+     when the number of images changes under the engine. The benches here are
+     single-window and never resize.
+   * **The GUI** (GTK4): game list from Steam's `appmanifest_*.acf`, per-game
+     profile (scale, sharpness, on/off), the launch options line written into
+     `localconfig.vdf`, and a launch button. The layer's environment variables
+     are already the whole interface, so the GUI is a writer of that line.
+   * **NIS** as an alternative `balanced` implementation, and a decision on
+     licensing (`third_party/ffx` is MIT; the layer itself has no third-party
+     code beyond the vendored FSR1 headers).
 
 ## Layout
 
 ```
+layer/lsl_layer.c         the layer: the size lie, swapchain capture, present interception
+layer/lsl_upscale.c       the in-layer FSR1 EASU->RCAS present engine, plus PPM dumps
+layer/lsl_layer.h         shared layer/engine state, per-device function tables
+layer/VkLayer_lsl_frame.json  layer manifest, loaded per game
 shaders/scale.comp        GLSL compute scaler (nearest/bilinear/cubic/lanczos2/EASU)
 shaders/rcas.comp         GLSL compute sharpener — FSR1's RCAS, a second dispatch
 shaders/                  compiled to SPIR-V at build time, embedded in the binary
@@ -532,6 +739,8 @@ src/upscale.cpp           lsl-upscale (fidelity + quality modes)
 tests/test_reference.cpp  CPU reference tests
 tools/embed_spv.py        SPIR-V -> C++ array
 tools/ffx_cpp_shim.py     GLSL 'inout'/'out' params -> C++ references
+tools/upscale-check.sh            layer gate: pixel match + validation + self-test
+tools/ppm_tool.py                 PPM compare (bytes / max delta / PSNR) and swap
 tools/setup-validation-layers.sh   per-user validation layer install (no root)
 tools/with-validation.sh          run a command with validation forced on
 tools/validation-check.sh         CTest wrapper; fails if validation is not really running

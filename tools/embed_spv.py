@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Embed SPIR-V files as C++ arrays so lsl binaries need no runtime data files.
+"""Embed SPIR-V files as C/C++ arrays so lsl binaries need no runtime data files.
 
-usage: embed_spv.py <spv_dir> <out_cpp> <out_hpp>
-"""
+usage: embed_spv.py [--lang c|cpp] <spv_dir> <out_src> <out_hdr>
+
+--lang cpp (the default) emits a C++ translation unit; --lang c emits the same
+arrays behind a C header, because the Vulkan layer is C and must not link a C++
+runtime. """
 import re
 import sys
 from pathlib import Path
@@ -13,11 +16,23 @@ def ident(stem: str) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
+    args = sys.argv[1:]
+    lang = "cpp"
+    if args and args[0].startswith("--lang"):
+        if "=" in args[0]:
+            lang = args[0].split("=", 1)[1]
+        else:
+            lang = args[1]
+            args = args[1:]
+        args = args[1:]
+    if len(args) != 3:
         print(__doc__, file=sys.stderr)
         return 2
+    if lang not in ("c", "cpp"):
+        print(f"unknown --lang {lang!r}", file=sys.stderr)
+        return 2
 
-    spv_dir, out_cpp, out_hpp = (Path(a) for a in sys.argv[1:])
+    spv_dir, out_src, out_hdr = (Path(a) for a in args)
 
     blobs = []
     for spv in sorted(spv_dir.glob("*.spv")):
@@ -29,8 +44,11 @@ def main() -> int:
         ]
         blobs.append((ident(spv.stem), data))
 
-    hpp = ["#pragma once", "#include <cstddef>", "#include <cstdint>", ""]
-    cpp = [f'#include "spv_blob.hpp"', ""]
+    if lang == "c":
+        hpp = ["#pragma once", "#include <stddef.h>", "#include <stdint.h>", ""]
+    else:
+        hpp = ["#pragma once", "#include <cstddef>", "#include <cstdint>", ""]
+    cpp = [f'#include "{out_hdr.name}"', ""]
 
     for name, data in blobs:
         hpp.append(f"extern const uint32_t lsl_spv_{name}[];")
@@ -43,8 +61,8 @@ def main() -> int:
         cpp.append(f"const size_t lsl_spv_{name}_words = {len(data)};")
         cpp.append("")
 
-    out_hpp.write_text("\n".join(hpp) + "\n")
-    out_cpp.write_text("\n".join(cpp) + "\n")
+    out_hdr.write_text("\n".join(hpp) + "\n")
+    out_src.write_text("\n".join(cpp) + "\n")
     return 0
 
 
