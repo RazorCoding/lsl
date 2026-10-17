@@ -32,8 +32,11 @@ yet; the layer is injected per game by hand.
 | FSR1 `balanced` tier | EASU upscaling **and** RCAS sharpening, both landed |
 | Frame capture / layer injection | **done** — `LSL_LAYER_CAPTURE`, `LSL_LAYER_SCALE` |
 | Present-time upscaling | **done** — render at 1/scale, FSR1 back to full size |
+| `src/steam.{hpp,cpp}` + `src/profile.{hpp,cpp}` | Steam discovery, in-place VDF edit, launch-options merge, per-game profiles |
+| `tests/test_steam.cpp` | 102 checks over the above, no display needed |
+| `gui/main.cpp` | `lsl-gui`: GTK4 window — game list, profile, launch options, launch button |
 | Motion estimation / frame generation | **not implemented** |
-| GUI, profiles, packaging | **not implemented** |
+| Packaging (a distributable layer + installer) | **not implemented** |
 
 ---
 
@@ -45,18 +48,22 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-CTest runs three tests: the 79 CPU reference checks (`reference`), a `validation`
-test that re-runs the scaler under the Khronos validation layers, and
-`layer-upscale`, which loads the layer into `vkcube` and checks its present-time
-result against the Phase 1 reference (see *Verifying the layer* below). The
-validation-dependent halves **skip themselves** unless the layers are installed:
+CTest runs six tests: the 79 CPU reference checks (`reference`), 102 checks over
+the Steam configuration core (`steam`), a `validation` test that re-runs the
+scaler under the Khronos validation layers, `layer-upscale`, which loads the
+layer into `vkcube` and checks its present-time result against the Phase 1
+reference (see *Verifying the layer* below), and two GUI selftests (headless
+`gui-selftest`, and `gui-window-selftest`, which builds the window and skips
+itself without a display). The validation-dependent halves **skip themselves**
+unless the layers are installed:
 
 ```sh
 tools/setup-validation-layers.sh     # per-user, no root, ~15 MB
 ```
 
 Requires: a C++20 compiler, CMake ≥ 3.20, Ninja, `glslc`, Vulkan headers+loader,
-Python 3, and `vkcube` (`vulkan-tools`) for the layer test; `libplacebo` is
+Python 3, and `vkcube` (`vulkan-tools`) for the layer test; `gtkmm-4.0` for the
+GUI, which is skipped if `pkg-config` cannot find it; `libplacebo` is
 deliberately *not* a dependency.
 
 ---
@@ -225,6 +232,63 @@ because they are exactly the class of bug the Phase 1 gates could not see:
 None of them is a wrong *picture* — they are exactly the kind of thing that
 would have shipped as "works on my machine" without the validation layer sitting
 in the right place.
+
+---
+
+## Phase 3 — the GUI
+
+`lsl-gui` (GTK4) is a writer of one string. The layer's whole interface is
+`VK_ADD_LAYER_PATH` plus `LSL_LAYER_SCALE` in a game's launch options, so the
+window's job is to remember a per-game profile and splice that line into
+`localconfig.vdf`:
+
+```
+./build/lsl-gui            # or --selftest / --selftest-window, see below
+```
+
+The split matters more than the window does. Everything that decides *what* to
+write — Steam root discovery, library and manifest parsing, the in-place VDF
+splice, the launch-options merge — lives in `src/steam.cpp` and `src/profile.cpp`
+with no GTK anywhere in sight, and is covered by `tests/test_steam.cpp` (102
+checks). The window is a thin shell over that, which is why it is also the least
+tested part: what can be checked without a human is checked by
+`lsl-gui --selftest`, which needs no display and puts *every game in the real
+Steam installation* through an apply-then-clear round trip, comparing the result
+with clearing the original. That is the check that matters, because the failure
+mode is not a crash: it is a user's `DXVK_HUD` or `%command%` quietly going
+missing. `--selftest-window` does the same and then builds the window on that
+data (skipping, exit 77, with no display) and prints the widget tree, so the
+layout can be reviewed from a log.
+
+Both are ctest tests (`gui-selftest`, `gui-window-selftest`), and the GUI target
+itself is optional: it is built only when `pkg-config` finds `gtkmm-4.0`, so the
+layer, the tools and the tests still build on a machine without GTK.
+
+Three properties are deliberate:
+
+* **The launch options are shown before they are written, in full.** A layer's
+  point is that the game is untouched; the same should hold for the user's
+  configuration, so there is no hidden checkbox that silently rewrites it.
+* **After a write the line is re-read from the file.** The "In Steam right now"
+  box shows what Steam will actually do, not what lsl intended.
+* **Steam is never guessed about.** If Steam is running, the window says so —
+  Steam rewrites `localconfig.vdf` when it exits, so a write made while it runs
+  is likely to be lost — and the launch button warns when a profile has not been
+  applied yet.
+
+Two known limits:
+
+* **Valve's tools look exactly like games** in everything lsl can read:
+  `appmanifest_*.acf` and `libraryfolders.vdf` are the same shape for Proton and
+  for a game, `appinfo.vdf` stores its records as opaque hashed blobs in current
+  Steam, and the store metadata in Steam's own cache is absent for a game that
+  has never been launched — so using it would hide real games. The window hides
+  Proton / Steam Linux Runtime / the redistributables by *name*
+  (`lsl::steamLooksLikeTool`, `"Hide Valve's tools"`, on by default, off with one
+  click), which on this host removes 8 of the 18 installed apps.
+* **One Steam user.** Steam's per-user configuration is edited for the user
+  directory that `localconfig.vdf`'s owner logic picks (the most recently used),
+  not for an account the window lets you choose.
 
 ---
 
@@ -460,6 +524,11 @@ The *Quality* table above is the one that ranks them.
   zero edge energy at every sharpness setting.
 * Zero core-validation errors on both GPUs, for all six modes (see *Validation
   layers* below).
+* `lsl-gui --selftest` puts every installed game's launch options through
+  apply-then-clear against the real `localconfig.vdf` and requires the round trip
+  to equal clearing the original — the failure it guards against is a dropped
+  `DXVK_HUD` or `%command%`, not a crash. `--selftest-window` adds the window and
+  skips without a display. Nothing in either mode writes to Steam's files.
 
 ---
 
@@ -711,10 +780,10 @@ and review — not on the layer.
      `VK_ERROR_OUT_OF_DATE_KHR` / `VK_SUBOPTIMAL_KHR` handling, and what happens
      when the number of images changes under the engine. The benches here are
      single-window and never resize.
-   * **The GUI** (GTK4): game list from Steam's `appmanifest_*.acf`, per-game
-     profile (scale, sharpness, on/off), the launch options line written into
-     `localconfig.vdf`, and a launch button. The layer's environment variables
-     are already the whole interface, so the GUI is a writer of that line.
+   * ~~**The GUI** (GTK4)~~ — **done**, see *Phase 3* above: game list from
+     `appmanifest_*.acf`, a per-game profile, the launch-options line written
+     into `localconfig.vdf`, and a launch button. Still missing from this tier:
+     packaging, so the layer can be installed without building it.
    * **NIS** as an alternative `balanced` implementation, and a decision on
      licensing (`third_party/ffx` is MIT; the layer itself has no third-party
      code beyond the vendored FSR1 headers).
@@ -731,6 +800,10 @@ shaders/rcas.comp         GLSL compute sharpener — FSR1's RCAS, a second dispa
 shaders/                  compiled to SPIR-V at build time, embedded in the binary
 third_party/ffx/          AMD ffx_a.h + ffx_fsr1.h (MIT), vendored unmodified
 src/lsl_vk.*              Vulkan scaffolding
+gui/main.cpp             lsl-gui: the GTK4 window (optional target)
+src/steam.{hpp,cpp}       Steam discovery, in-place VDF edit, launch-options merge
+src/profile.{hpp,cpp}     the per-game profile store (plain text, atomic writes)
+tests/test_steam.cpp      the above, tested without a display
 src/reference.*           CPU filters, box downsampler, PSNR/SSIM, edge energy
 src/fsr1_ref.cpp          CPU FSR1 EASU + RCAS; compiles the vendored header via a shim
 src/image_io.*            PPM/PGM I/O

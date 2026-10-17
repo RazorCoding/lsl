@@ -112,6 +112,16 @@ set_source_files_properties(src/fsr1_ref.cpp PROPERTIES COMPILE_OPTIONS -ffp-con
 add_dependencies(lsl_core lsl_shaders lsl_ffx_cpp)
 
 # ---------------------------------------------------------------------------
+# Steam configuration (the GUI's core)
+#
+# No Vulkan and no GTK: this is the part that decides what to write into
+# Steam's own files, so it is kept separate and tested on its own.
+# ---------------------------------------------------------------------------
+add_library(lsl_steam STATIC src/steam.cpp src/profile.cpp)
+target_include_directories(lsl_steam PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(lsl_steam PRIVATE -Wall -Wextra)
+
+# ---------------------------------------------------------------------------
 # executables
 # ---------------------------------------------------------------------------
 add_executable(lsl-probe   src/probe.cpp)
@@ -122,6 +132,31 @@ target_link_libraries(lsl-upscale PRIVATE lsl_core)
 
 add_executable(lsl-tests   tests/test_reference.cpp)
 target_link_libraries(lsl-tests PRIVATE lsl_core)
+
+add_executable(lsl-steam-tests tests/test_steam.cpp)
+target_link_libraries(lsl-steam-tests PRIVATE lsl_steam)
+
+# ---------------------------------------------------------------------------
+# GUI (optional)
+#
+# The window is the last and least interesting part: everything it does is
+# "call into lsl_steam and show the result".  gtkmm-4.0 is the only dependency
+# lsl has that is not already needed to build the layer, so it is optional --
+# the layer, the tools and the tests build without it, and a machine with only
+# the command line still works.
+# ---------------------------------------------------------------------------
+include(FindPkgConfig)
+if(PkgConfig_FOUND)
+  pkg_check_modules(GTKMM4 QUIET IMPORTED_TARGET gtkmm-4.0)
+endif()
+if(GTKMM4_FOUND)
+  add_executable(lsl-gui gui/main.cpp)
+  target_link_libraries(lsl-gui PRIVATE lsl_steam PkgConfig::GTKMM4)
+  target_compile_options(lsl-gui PRIVATE -Wall -Wextra)
+else()
+  message(STATUS
+          "gtkmm-4.0 not found -- building without the GUI (lsl-gui)")
+endif()
 
 # ---------------------------------------------------------------------------
 # Phase 2: the frame-injection layer
@@ -170,6 +205,10 @@ file(GENERATE
 enable_testing()
 add_test(NAME reference COMMAND lsl-tests)
 
+# The GUI's core: Steam discovery and the launch-options editor.  Pure text and
+# files, so it runs anywhere.
+add_test(NAME steam COMMAND lsl-steam-tests)
+
 # Runs the scaler under the Khronos validation layer and fails on any validation
 # error.  Skips itself when the layers are absent (tools/setup-validation-layers.sh).
 add_test(NAME validation
@@ -187,3 +226,16 @@ add_test(NAME layer-upscale
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/upscale-check.sh
                  ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(layer-upscale PROPERTIES SKIP_RETURN_CODE 77)
+
+# The GUI's launch-options logic, checked against whatever Steam installation
+# this machine actually has: every game is put through an apply/clear round
+# trip, which is the part that could damage someone's configuration.  Needs no
+# display, so it runs everywhere.
+if(TARGET lsl-gui)
+  add_test(NAME gui-selftest COMMAND lsl-gui --selftest)
+
+  # The same, plus building the window on that data.  Skips (77) with no
+  # display; the window is never presented either way.
+  add_test(NAME gui-window-selftest COMMAND lsl-gui --selftest-window)
+  set_tests_properties(gui-window-selftest PROPERTIES SKIP_RETURN_CODE 77)
+endif()
