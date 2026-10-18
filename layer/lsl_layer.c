@@ -450,25 +450,26 @@ static Chain *chain_alloc(void) {
 typedef struct {
     VkQueue queue;
     uint32_t family;
+    VkDevice dev;   /* the device this queue belongs to */
 } QueueEntry;
 
 static QueueEntry g_queues[LSL_MAX_QUEUES];
 static int g_queue_count;
 
-static void note_queue(VkQueue q, uint32_t family) {
+static void note_queue(VkQueue q, uint32_t family, VkDevice dev) {
     if (q == VK_NULL_HANDLE) return;
     for (int i = 0; i < g_queue_count; ++i)
-        if (g_queues[i].queue == q) {
+        if (g_queues[i].queue == q && g_queues[i].dev == dev) {
             g_queues[i].family = family;
             return;
         }
     if (g_queue_count < LSL_MAX_QUEUES)
-        g_queues[g_queue_count++] = (QueueEntry){q, family};
+        g_queues[g_queue_count++] = (QueueEntry){q, family, dev};
 }
 
-static uint32_t family_of_queue(VkQueue q) {
+static uint32_t family_of_queue(VkQueue q, VkDevice dev) {
     for (int i = 0; i < g_queue_count; ++i)
-        if (g_queues[i].queue == q) return g_queues[i].family;
+        if (g_queues[i].queue == q && g_queues[i].dev == dev) return g_queues[i].family;
     return UINT32_MAX;
 }
 
@@ -1025,9 +1026,14 @@ VKAPI_ATTR void VKAPI_CALL lsl_DestroyDevice(VkDevice dev,
      * attempted but QueueEntry has no dev field; the memset is restored
      * because the crash investigation showed the issue is the static function
      * pointers, not the chain clearing. */
-    memset(g_chains, 0, sizeof(g_chains));
-    memset(g_queues, 0, sizeof(g_queues));
-    g_queue_count = 0;
+    /* Clear only this device's chains and queues, not other devices'. */
+    for (int i = 0; i < LSL_MAX_SWAPCHAINS; ++i)
+        if (g_chains[i].sc != VK_NULL_HANDLE && g_chains[i].dev == dev)
+            g_chains[i].sc = VK_NULL_HANDLE;
+    int nq = 0;
+    for (int i = 0; i < g_queue_count; ++i)
+        if (g_queues[i].dev != dev) g_queues[nq++] = g_queues[i];
+    g_queue_count = nq;
     forget_device(dev);
     if (!gdpa) return;
     PFN_vkDestroyDevice next = (PFN_vkDestroyDevice)gdpa(dev, "vkDestroyDevice");
@@ -1039,7 +1045,7 @@ VKAPI_ATTR void VKAPI_CALL lsl_GetDeviceQueue(VkDevice dev, uint32_t family,
     PFN_vkGetDeviceQueue next = (PFN_vkGetDeviceQueue)dev_gdpa(dev)(dev, "vkGetDeviceQueue");
     if (!next) return;
     next(dev, family, index, queue);
-    if (queue) note_queue(*queue, family);
+    if (queue) note_queue(*queue, family, dev);
 }
 
 VKAPI_ATTR void VKAPI_CALL lsl_GetDeviceQueue2(VkDevice dev,
@@ -1048,7 +1054,7 @@ VKAPI_ATTR void VKAPI_CALL lsl_GetDeviceQueue2(VkDevice dev,
     PFN_vkGetDeviceQueue2 next = (PFN_vkGetDeviceQueue2)dev_gdpa(dev)(dev, "vkGetDeviceQueue2");
     if (!next) return;
     next(dev, info, queue);
-    if (queue && info) note_queue(*queue, info->queueFamilyIndex);
+    if (queue && info) note_queue(*queue, info->queueFamilyIndex, dev);
 }
 
 /* Rewrites the application's swapchain: a larger real extent when upscaling is
@@ -1278,7 +1284,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_QueuePresentKHR(VkQueue queue, const VkPresen
     }
 
     if (have_frame && c->upscale && c->dev == lsl_upscale_device()) {
-        if (lsl_upscale_run(queue, family_of_queue(queue), c->images[index],
+        if (lsl_upscale_run(queue, family_of_queue(queue, c->dev), c->images[index],
                             lsl_env_str("LSL_LAYER_DUMP")))
             g_upscaled++;
     } else if (c && c->upscale && !c->have_images) {
@@ -1369,7 +1375,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL lsl_GetDeviceProcAddr(VkDevice dev, con
     if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)lsl_DestroyDevice;
     if (!strcmp(name, "vkGetDeviceQueue")) return (PFN_vkVoidFunction)lsl_GetDeviceQueue;
     if (!strcmp(name, "vkGetDeviceQueue2")) return (PFN_vkVoidFunction)lsl_GetDeviceQueue2;
-    return g_next_gdpa(dev, name);
+    PFN_vkGetDeviceProcAddr gdpa = dev_gdpa(dev);
+    if (!gdpa) return NULL;
+    return gdpa(dev, name);
 }
 
 /* ---------------------------------------------------- exported entry points */
