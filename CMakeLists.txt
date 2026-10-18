@@ -291,6 +291,15 @@ add_test(NAME layer-resize
                  ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(layer-resize PROPERTIES SKIP_RETURN_CODE 77)
 
+# Several live instances and devices in one process, a device destroyed while
+# the next is made -- the shape a Proton game (SnowRunner) has and the one that
+# crashed when the next chain's entry points lived in a single global.  Needs no
+# display, so it covers the lifecycle everywhere.
+add_test(NAME layer-multidev
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/multidev-check.sh
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(layer-multidev PROPERTIES SKIP_RETURN_CODE 77)
+
 # The implicit path: the layer is found by the loader on its own and decides from
 # SteamAppId whether this process is a game the GUI enabled.  Nothing is passed
 # through launch options, and the negative controls prove the layer is loaded but
