@@ -276,7 +276,16 @@ void Window::buildWidgets() {
     set_default_size(1000, 660);
 
     auto css = Gtk::CssProvider::create();
-    css->load_from_string(".lsl-error { color: #c01c28; }\n");
+    css->load_from_string(
+        ".lsl-error { color: #ff6b6b; }\n"
+        ".lsl-section { font-weight: 700; font-size: 1.05em; margin-top: 10px; }\n"
+        ".lsl-dim { color: #9aa0a6; font-size: 0.9em; }\n"
+        "window { background-color: #1e1e2e; color: #e0e0e0; }\n"
+        ".title { font-weight: 700; font-size: 1.3em; color: #cdd6f4; }\n"
+        "button { background: #313244; color: #cdd6f4; border: 1px solid #45475a; }\n"
+        "button:hover { background: #45475a; }\n"
+        "entry, spinbutton { background: #313244; color: #cdd6f4; }\n"
+        "listview, listbox { background: #181825; }\n");
     if (auto display = Gdk::Display::get_default()) {
         Gtk::StyleProvider::add_provider_for_display(
             display, css, GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -285,6 +294,7 @@ void Window::buildWidgets() {
     auto* header = Gtk::make_managed<Gtk::HeaderBar>();
     auto* title = Gtk::make_managed<Gtk::Label>("lsl");
     title->add_css_class("title");
+    title->set_text("lsl  -  Lossless Scaling for Linux");
     header->set_title_widget(*title);
     auto* refresh = Gtk::make_managed<Gtk::Button>("Refresh");
     refresh->set_tooltip_text(
@@ -381,6 +391,11 @@ void Window::buildWidgets() {
     details->append(*Gtk::make_managed<Gtk::Separator>(
         Gtk::Orientation::HORIZONTAL));
 
+    auto* secScaling = Gtk::make_managed<Gtk::Label>("Scaling");
+    secScaling->set_xalign(0.0f);
+    secScaling->add_css_class("lsl-section");
+    details->append(*secScaling);
+
     enable_ = Gtk::make_managed<Gtk::Switch>();
     enable_->set_tooltip_text(
         "Whether the profile is enabled for this game.  Nothing reaches the "
@@ -396,6 +411,11 @@ void Window::buildWidgets() {
         "2 means half resolution in each axis.");
     scale_->signal_value_changed().connect([this] { onSettingsChanged(); });
     addRow(*details, "Scale factor", *scale_);
+
+    auto* secPerf = Gtk::make_managed<Gtk::Label>("Performance");
+    secPerf->set_xalign(0.0f);
+    secPerf->add_css_class("lsl-section");
+    details->append(*secPerf);
 
     sharp_ = Gtk::make_managed<Gtk::SpinButton>(
         Gtk::Adjustment::create(0.0, -2.0, 4.0, 0.1, 0.5), 0.1, 2);
@@ -476,6 +496,26 @@ void Window::buildWidgets() {
 
     details->append(*Gtk::make_managed<Gtk::Separator>(
         Gtk::Orientation::HORIZONTAL));
+
+    auto* secFg = Gtk::make_managed<Gtk::Label>("Frame Generation");
+    secFg->set_xalign(0.0f);
+    secFg->add_css_class("lsl-section");
+    details->append(*secFg);
+    auto* fgNote = Gtk::make_managed<Gtk::Label>(
+        "Frame generation is not yet available in lsl (planned).  "
+        "When it lands, the toggle and multiplier will appear here.");
+    fgNote->set_xalign(0.0f);
+    fgNote->set_wrap(true);
+    fgNote->add_css_class("lsl-dim");
+    details->append(*fgNote);
+
+    details->append(*Gtk::make_managed<Gtk::Separator>(
+        Gtk::Orientation::HORIZONTAL));
+
+    auto* secTools = Gtk::make_managed<Gtk::Label>("Tools");
+    secTools->set_xalign(0.0f);
+    secTools->add_css_class("lsl-section");
+    details->append(*secTools);
 
     auto* layerLabel = Gtk::make_managed<Gtk::Label>(
         "Layer directory (the one holding VkLayer_lsl_frame.json)");
