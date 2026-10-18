@@ -275,17 +275,24 @@ void Window::buildWidgets() {
     set_title("lsl");
     set_default_size(1000, 660);
 
+    // Force a light appearance even when the system prefers dark mode.
+    if (auto settings = Gtk::Settings::get_default()) {
+        settings->set_property("gtk-application-prefer-dark-theme", false);
+    }
+
     auto css = Gtk::CssProvider::create();
     css->load_from_string(
-        ".lsl-error { color: #c01c28; }\n"
-        ".lsl-section { font-weight: 700; font-size: 1.05em; margin-top: 10px; }\n"
-        ".lsl-dim { color: #5e5c64; font-size: 0.9em; }\n"
-        "window { background-color: #fafafa; color: #1e1e2e; }\n"
-        ".title { font-weight: 700; font-size: 1.3em; color: #1e1e2e; }\n"
-        "button { background: #ffffff; color: #1e1e2e; border: 1px solid #c0c0c0; }\n"
-        "button:hover { background: #e8e8e8; }\n"
-        "entry, spinbutton { background: #ffffff; color: #1e1e2e; }\n"
-        "listview, listbox { background: #ffffff; }\n");
+        ".lsl-error { color: #d6336c; font-weight: 600; }\n"
+        ".lsl-section { font-weight: 700; font-size: 1.05em; margin-top: 12px; color: #2563eb; }\n"
+        ".lsl-dim { color: #6b7280; font-size: 0.9em; }\n"
+        "window { background-color: #f8f9fa; color: #1f2937; }\n"
+        ".title { font-weight: 700; font-size: 1.3em; color: #1f2937; }\n"
+        "button { background: #ffffff; color: #1f2937; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 12px; }\n"
+        "button:hover { background: #eff6ff; border-color: #2563eb; color: #2563eb; }\n"
+        "entry, spinbutton { background: #ffffff; color: #1f2937; border: 1px solid #d1d5db; border-radius: 4px; }\n"
+        "listview, listbox { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 6px; }\n"
+        "headerbar { background: #ffffff; border-bottom: 1px solid #e5e7eb; }\n"
+        "separator { background: #e5e7eb; }\n");
     if (auto display = Gdk::Display::get_default()) {
         Gtk::StyleProvider::add_provider_for_display(
             display, css, GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
