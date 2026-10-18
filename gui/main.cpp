@@ -953,11 +953,26 @@ void Window::onViewLogClicked() {
                   true);
         return;
     }
+    // Prefer a real text editor over xdg-open: .log files often resolve to a
+    // browser (or nothing) under xdg-open, which is not what the user wants.
+    const char* editors[] = {"gedit", "mousepad", "kate", "kwrite", "pluma",
+                             "xed", "leafpad", "gvim", "vim", "nano", nullptr};
+    std::string cmd;
+    for (int i = 0; editors[i]; ++i) {
+        std::error_code ec;
+        if (fs::exists("/usr/bin/" + std::string(editors[i]), ec) ||
+            fs::exists("/bin/" + std::string(editors[i]), ec)) {
+            cmd = std::string(editors[i]) + " \"" + path + "\"";
+            break;
+        }
+    }
+    if (cmd.empty()) cmd = "xdg-open \"" + path + "\"";
     try {
-        Glib::spawn_command_line_async("xdg-open \"" + path + "\"");
-        setStatus("Opened " + path + ".", false);
+        Glib::spawn_command_line_async(cmd);
+        setStatus("Opened " + path + " with " + cmd.substr(0, cmd.find(' ')) + ".", false);
     } catch (const Glib::Error& e) {
-        setStatus("Could not open the log: " + std::string(e.what()), true);
+        setStatus("Could not open the log: " + std::string(e.what()) +
+                      "  (file is at " + path + ")", true);
     }
 }
 
