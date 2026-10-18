@@ -100,14 +100,24 @@ std::string executableDir() {
 }
 
 // Where VkLayer_lsl_frame.json might be: $LSL_LAYER_DIR first, then the build
-// tree beside this executable, then the unpackaged tree it was built from.
+// tree beside this executable, then the unpackaged tree it was built from, then
+// the place tools/install-layer.sh installs to.  The installed locations come
+// last so a development tree keeps winning, but they mean the window still
+// finds a real layer after the build tree is gone.
 std::string guessLayerDir() {
     if (const char* env = std::getenv("LSL_LAYER_DIR"); env && *env) return env;
     const std::string here = executableDir();
-    if (here.empty()) return {};
-    const std::vector<std::string> candidates = {here + "/layer",
-                                                 here + "/../build/layer",
-                                                 here + "/../layer"};
+    std::vector<std::string> candidates;
+    if (!here.empty()) {
+        candidates.push_back(here + "/layer");
+        candidates.push_back(here + "/../build/layer");
+        candidates.push_back(here + "/../layer");
+    }
+    if (const char* home = std::getenv("HOME"); home && *home)
+        candidates.push_back(std::string(home) + "/.local/lib/lsl/layer");
+    candidates.push_back("/usr/local/lib/lsl/layer");
+    candidates.push_back("/usr/lib/lsl/layer");
+
     for (const std::string& dir : candidates) {
         std::error_code ec;
         if (fs::is_regular_file(dir + "/VkLayer_lsl_frame.json", ec)) {
@@ -115,7 +125,7 @@ std::string guessLayerDir() {
             return ec ? dir : canonical.string();
         }
     }
-    return here + "/layer";
+    return here.empty() ? std::string() : here + "/layer";
 }
 
 // The method dropdown's contents: "auto" first, then every name in

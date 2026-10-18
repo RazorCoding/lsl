@@ -4,15 +4,18 @@ A from-scratch Vulkan compute upscaler for games running under Steam/Proton on
 Wayland (CachyOS/Arch + Hyprland). No code, binaries, or models are taken from
 Lossless Scaling or from `lsfg-vk`.
 
-**Current state: Phase 1, the Phase 2 layer and the Phase 3 GUI.** Phase 1 is
-the scaler core and its benchmark — nine upscaling methods, from nearest
-neighbour through FSR1 + RCAS and NIS sharpening to Anime4K's Restore CNN.
-Phase 2 is a Vulkan layer that makes a running application render at a fraction
-of the surface size and upscales the frame at present time with any of them,
-including `auto`, which picks one per swapchain from the render size. Phase 3 is
-a GTK4 window that writes those environment variables into a game's Steam launch
-options. What is not built is frame generation and packaging; on a real game the
-layer is still injected by hand or through the window.
+**Current state: Phase 1, the Phase 2 layer, the Phase 3 GUI and its Phase 4
+methods; packaging landed with it.** Phase 1 is the scaler core and its benchmark
+— nine upscaling methods, from nearest neighbour through FSR1 + RCAS and NIS
+sharpening to Anime4K's Restore CNN. Phase 2 is a Vulkan layer that makes a
+running application render at a fraction of the surface size and upscales the
+frame at present time with any of them, including `auto`, which picks one per
+swapchain from the render size. Phase 3 is a GTK4 window that writes those
+environment variables into a game's Steam launch options; `tools/install-layer.sh`
+puts the layer where it can stay. What is still not built is frame generation
+(and FSR2/3-style temporal upscaling, which needs motion vectors a present-time
+layer never sees); on a real game the layer is injected by hand or through the
+window.
 
 ---
 
@@ -47,8 +50,10 @@ layer is still injected by hand or through the window.
 | `gui/main.cpp` | `lsl-gui`: GTK4 window — game list, profile, launch options, launch button |
 | `tools/resize-check.c` | WSI harness: swapchain recreated with `oldSwapchain`, resize storms |
 | `tools/resize-check.sh` | layer gate: every recreate upscaled, extent-only rebuild, post-recreate dump matches the reference, zero validation messages |
+| `tools/install-layer.sh` | installs the layer + manifest into a prefix (no root), prints the launch line |
+| `tools/install-check.sh` | packaging gate: installs into a throwaway prefix and proves the installed copy loads — and that a bad `library_path` does not |
 | Motion estimation / frame generation | **not implemented** |
-| Packaging (a distributable layer + installer) | **not implemented** |
+| Packaging (a distributable layer + installer) | **done** — `cmake --install` + `tools/install-layer.sh` |
 
 ---
 
@@ -60,12 +65,14 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-CTest runs seven tests: the 111 CPU reference checks (`reference`), 156 checks
+CTest runs eight tests: the 111 CPU reference checks (`reference`), 156 checks
 over the Steam configuration core (`steam`), a `validation` test that re-runs the
 scaler under the Khronos validation layers, `layer-upscale`, which loads the
 layer into `vkcube` and checks its present-time result against the Phase 1
 reference (see *Verifying the layer* below), `layer-resize`, which drives the
-layer through recreated swapchains (see *Resizing* below), and two GUI selftests (headless
+layer through recreated swapchains (see *Resizing* below), `layer-install`, which
+installs the layer into a throwaway prefix and checks the *installed* copy loads
+(see *Installing the layer* below), and two GUI selftests (headless
 `gui-selftest`, and `gui-window-selftest`, which builds the window and skips
 itself without a display). The validation-dependent halves **skip themselves**
 unless the layers are installed:
@@ -106,6 +113,37 @@ so the rest of the line can stay while scaling is off.
 | `LSL_LAYER_CAPTURE` | `1` = the Phase-1-style readback path (hash per frame), slow by design |
 | `LSL_LAYER_CAPTURE_FRAMES` | stop capturing after N frames (default 12, `0` = no limit) |
 | `LSL_LAYER_BREAK_LAYOUT` | test-only: leave the image in the wrong layout, to prove validation is really looking at the layer |
+
+### Installing the layer
+
+The launch line above points into the build tree, which is fine while developing
+and breaks the moment the tree moves. `tools/install-layer.sh` copies the shared
+object and a manifest that names it **absolutely** into a prefix instead —
+`~/.local` by default, no root:
+
+```sh
+./tools/install-layer.sh                  # into ~/.local
+./tools/install-layer.sh --prefix /opt/lsl
+```
+
+It prints the exact launch line for that prefix, and `tools/uninstall-layer.sh`
+removes it again. The layout is `<prefix>/lib/lsl/layer/` holding
+`liblsl-layer.so` and `VkLayer_lsl_frame.json` — the same shape as `build/layer`,
+so the GUI's directory check and `LSL_LAYER_DIR` accept either.
+
+Two things are deliberate:
+
+* **It is not installed where the loader scans automatically.** The manifest does
+  not go under `vulkan/implicit_layer.d`, because the layer is enabled per game,
+  not for every Vulkan application on the machine. The launch line already sets
+  `VK_ADD_LAYER_PATH`, which is all a per-game layer needs.
+* **The manifest is written at install time.** `library_path` has to be absolute
+  — the loader does not resolve it against the manifest's own directory, the same
+  trap that stops the packaged `lsfg-vk` layer from loading (see *Validation
+  layers*) — and it has to name the *installed* object, not the build one. So the
+  installed manifest is generated by `cmake --install`, after `--prefix` is
+  known, and `tools/install-check.sh` fails if the path is relative, points at
+  nothing, or the installed copy does not actually load.
 
 ### How the lie works
 
@@ -951,15 +989,18 @@ and review — not on the layer.
      single-window and never resize.
    * ~~**The GUI** (GTK4)~~ — **done**, see *Phase 3* above: game list from
      `appmanifest_*.acf`, a per-game profile, the launch-options line written
-     into `localconfig.vdf`, and a launch button. Still missing from this tier:
-     packaging, so the layer can be installed without building it.
+     into `localconfig.vdf`, and a launch button. Its packaging half is also
+     done — see *Installing the layer*.
    * ~~**More methods, and `auto`**~~ — **done**, see *Methods* above: `lanczos3`,
      `nis` and Anime4K v4's Restore CNN (`cnn`), selected by `LSL_LAYER_MODE`,
      with `auto` resolving from geometry. Licensing matches the existing
      pattern: `third_party/ffx` and `third_party/anime4k` are both MIT and
      vendored unmodified, and the layer has no other third-party code.
-   * **Packaging.** A distributable layer plus an installer, so a game can be
-     given the launch line without building the tree first.
+   * ~~**Packaging**~~ — **done**, see *Installing the layer*: `cmake --install`
+     plus `tools/install-layer.sh` put the layer and an absolute-path manifest
+     into a prefix, and `layer-install` loads the installed copy to prove it.
+     Still open here: shipping a built artifact for machines that will not build
+     the tree at all.
 
 ## Layout
 

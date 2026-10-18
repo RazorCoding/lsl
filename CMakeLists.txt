@@ -208,27 +208,16 @@ add_dependencies(lsl-layer lsl_anime4k_weights)
 # The manifest has to carry an absolute library_path: the loader does not
 # resolve it relative to the manifest, which is exactly the reason the
 # system-installed lsfg-vk layer never loads on this host (see README).
+#
+# One template serves the build tree and `cmake --install` (see the install
+# block at the end of this file), so the name, type and entry points a test
+# loads cannot drift from the ones an installer writes.
 set(LSL_LAYER_DIR ${CMAKE_CURRENT_BINARY_DIR}/layer)
+set(LSL_LAYER_LIBRARY_PATH
+    "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}lsl-layer${CMAKE_SHARED_LIBRARY_SUFFIX}")
 file(MAKE_DIRECTORY ${LSL_LAYER_DIR})
-file(GENERATE
-     OUTPUT ${LSL_LAYER_DIR}/VkLayer_lsl_frame.json
-     CONTENT
-"{
-    \"file_format_version\": \"1.0.0\",
-    \"layer\": {
-        \"name\": \"VK_LAYER_LSL_frame\",
-        \"type\": \"GLOBAL\",
-        \"library_path\": \"$<TARGET_FILE:lsl-layer>\",
-        \"api_version\": \"1.3.0\",
-        \"implementation_version\": \"1\",
-        \"description\": \"lsl frame injection (Phase 2 prototype)\",
-        \"functions\": {
-            \"vkGetInstanceProcAddr\": \"vkGetInstanceProcAddr\",
-            \"vkGetDeviceProcAddr\": \"vkGetDeviceProcAddr\"
-        }
-    }
-}
-")
+configure_file(cmake/VkLayer_lsl_frame.json.in
+               ${LSL_LAYER_DIR}/VkLayer_lsl_frame.json @ONLY)
 
 enable_testing()
 add_test(NAME reference COMMAND lsl-tests)
@@ -280,3 +269,42 @@ if(TARGET lsl-gui)
   add_test(NAME gui-window-selftest COMMAND lsl-gui --selftest-window)
   set_tests_properties(gui-window-selftest PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# Packaging: install the layer into a throwaway prefix and prove the *installed*
+# manifest and shared object load and upscale -- the copy the tests above use is
+# the build tree's, which says nothing about what `cmake --install` writes.  The
+# gate reuses upscale-check.sh with LSL_LAYER_DIR pointed at the installed
+# directory.  Skips (77) without a display, like the other layer tests.
+add_test(NAME layer-install
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/install-check.sh
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(layer-install PROPERTIES SKIP_RETURN_CODE 77)
+
+# ---------------------------------------------------------------------------
+# install
+#
+# The layer is enabled per game from its launch options (VK_ADD_LAYER_PATH +
+# VK_INSTANCE_LAYERS), so packaging means placing the shared object and its
+# manifest somewhere stable and pointing the game's launch line at it -- not
+# registering it under vulkan/implicit_layer.d, which would load it into every
+# Vulkan application on the machine.  tools/install-layer.sh does exactly that
+# and prints the line to paste.
+#
+# The manifest's library_path must be absolute and must name the *installed*
+# object, so it is written here at install time rather than configure time:
+# `cmake --install --prefix <dir>` then leaves a correct path behind, with
+# $ENV{DESTDIR} honoured for staged (packager) installs.
+# ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS lsl-layer
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/lsl/layer)
+install(CODE "
+  set(_runtime_dir \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/lsl/layer\")
+  set(_disk_dir \"\$ENV{DESTDIR}\${_runtime_dir}\")
+  file(MAKE_DIRECTORY \"\${_disk_dir}\")
+  set(LSL_LAYER_LIBRARY_PATH
+      \"\${_runtime_dir}/${CMAKE_SHARED_LIBRARY_PREFIX}lsl-layer${CMAKE_SHARED_LIBRARY_SUFFIX}\")
+  configure_file(\"${CMAKE_CURRENT_SOURCE_DIR}/cmake/VkLayer_lsl_frame.json.in\"
+                 \"\${_disk_dir}/VkLayer_lsl_frame.json\" @ONLY)
+  message(STATUS \"lsl: layer installed in \${_runtime_dir}\")
+")

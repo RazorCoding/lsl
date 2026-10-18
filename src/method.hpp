@@ -70,9 +70,12 @@ inline const char* modeLabel(unsigned mode) {
 // not an error, so it answers with -1 rather than throwing.
 inline int methodIdFromName(const char* n) {
     if (!n || !*n) return -1;
+    // canonical aliases
+    const char* b = n;
+    if (b[0] == 'f' && b[1] == 's' && b[2] == 'r' && b[3] == '\0') return MODE_FSR1RCAS;
     for (unsigned m = 0; m < MODE_COUNT; ++m) {
         const char* a = methodTable()[m].name;
-        const char* b = n;
+        b = n;
         while (*a && *a == *b) { ++a; ++b; }
         if (*a == '\0' && *b == '\0') return int(m);
     }

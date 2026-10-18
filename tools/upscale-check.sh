@@ -44,6 +44,9 @@
 #   LSL_CHECK_SELFTEST=0   skip the deliberate-error pass
 #   LSL_VVL_DIR=...        where the layer manifest lives
 #                          (default ~/.local/share/vulkan-validation)
+#   LSL_LAYER_DIR=...      the layer to load, instead of <build>/layer.  This is
+#                          how the install gate points the same checks at a
+#                          `cmake --install`ed copy (see tools/install-check.sh)
 #   LSL_CHECK_WSI=xcb|wayland
 #   LSL_CHECK_SCALE=N      (default 2)
 #   LSL_CHECK_MODES=...    comma-separated methods to check instead of all
@@ -59,7 +62,7 @@ case "${BUILD_DIR}" in
   /*) BUILD_ROOT="${BUILD_DIR}" ;;
   *) BUILD_ROOT="${ROOT}/${BUILD_DIR}" ;;
 esac
-LAYER_DIR="${BUILD_ROOT}/layer"
+LAYER_DIR="${LSL_LAYER_DIR:-${BUILD_ROOT}/layer}"
 UPSCALE="${BUILD_ROOT}/lsl-upscale"
 PPM_TOOL="${ROOT}/tools/ppm_tool.py"
 WSI="${LSL_CHECK_WSI:-xcb}"

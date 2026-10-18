@@ -42,6 +42,10 @@ int lsl_mode_parse(const char *name, uint32_t *out) {
         *out = LSL_MODE_AUTO;
         return 0;
     }
+    if (name_is(name, "fsr")) {
+        *out = LSL_MODE_FSR1RCAS;
+        return 0;
+    }
     for (uint32_t i = 0; i < LSL_MODE_COUNT; ++i) {
         if (name_is(name, k_methods[i].name)) {
             *out = i;
