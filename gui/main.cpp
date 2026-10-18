@@ -192,6 +192,7 @@ private:
     void onLaunchClicked();
     void onCheckSetupClicked();
     void onViewLogClicked();
+    void onInstallLayerClicked();
 
     // display
     void selectIndex(size_t index);
@@ -231,6 +232,7 @@ private:
     Gtk::Button* launch_ = nullptr;
     Gtk::Button* checkSetup_ = nullptr;
     Gtk::Button* viewLog_ = nullptr;
+    Gtk::Button* installLayer_ = nullptr;
     Gtk::Label* status_ = nullptr;
 
     std::vector<lsl::SteamGame> games_;
@@ -460,10 +462,16 @@ void Window::buildWidgets() {
     viewLog_->set_tooltip_text(
         "Open the layer's log file (set LSL_LAYER_LOG to enable logging).");
     viewLog_->signal_clicked().connect([this] { onViewLogClicked(); });
+    installLayer_ = Gtk::make_managed<Gtk::Button>("Install layer (no launch options)");
+    installLayer_->set_tooltip_text(
+        "Install the layer where the Vulkan loader finds it on its own, so games "
+        "upscale from their Play button with no launch options. Run once.");
+    installLayer_->signal_clicked().connect([this] { onInstallLayerClicked(); });
     buttons->append(*apply_);
     buttons->append(*launch_);
     buttons->append(*checkSetup_);
     buttons->append(*viewLog_);
+    buttons->append(*installLayer_);
     details->append(*buttons);
 
     details->append(*Gtk::make_managed<Gtk::Separator>(
@@ -973,6 +981,53 @@ void Window::onViewLogClicked() {
     } catch (const Glib::Error& e) {
         setStatus("Could not open the log: " + std::string(e.what()) +
                       "  (file is at " + path + ")", true);
+    }
+}
+
+void Window::onInstallLayerClicked() {
+    // Find install-layer.sh: it ships next to this source tree. Try the layer
+    // dir's parent, a few well-known install locations, then the source tree.
+    std::vector<std::string> candidates;
+    if (!store_.layer_dir.empty()) {
+        fs::path p = fs::path(store_.layer_dir).parent_path() / "tools" / "install-layer.sh";
+        candidates.push_back(p.string());
+    }
+    candidates.push_back("/usr/share/lsl/tools/install-layer.sh");
+    candidates.push_back("/usr/local/share/lsl/tools/install-layer.sh");
+    candidates.push_back(std::string(std::getenv("HOME") ? std::getenv("HOME") : "") +
+                         "/.local/share/lsl/tools/install-layer.sh");
+    // The dev tree, if still present.
+    candidates.push_back("/home/Gnana/Code/lsl/tools/install-layer.sh");
+
+    std::string script;
+    for (const auto& c : candidates) {
+        std::error_code ec;
+        if (fs::is_regular_file(c, ec)) { script = c; break; }
+    }
+    if (script.empty()) {
+        setStatus("Could not find install-layer.sh. Install the layer manually:\\n"
+                  "  tools/install-layer.sh --prefix ~/.local --implicit",
+                  true);
+        return;
+    }
+
+    // Prefix: ~/.local (user install) unless LSL_PREFIX is set.
+    const char* pref = std::getenv("LSL_PREFIX");
+    std::string prefix = (pref && *pref) ? pref : (std::string(std::getenv("HOME")) + "/.local");
+
+    setStatus("Installing layer (implicit) with " + script + " ...", false);
+    std::string cmd = script + " --prefix " + prefix + " --implicit";
+    try {
+        // Run synchronously-ish: spawn and forget, then refresh after a short
+        // delay is not possible without a timer; instead tell the user to
+        // click "Check setup" afterwards.
+        Glib::spawn_command_line_async(cmd);
+        setStatus("Install started (" + cmd + "). Wait a moment, then click "
+                  "\"Check setup\" to confirm the implicit manifest appeared.",
+                  false);
+    } catch (const Glib::Error& e) {
+        setStatus("Could not run the installer: " + std::string(e.what()) +
+                      "\\nRun manually: " + cmd, true);
     }
 }
 
