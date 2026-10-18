@@ -1036,8 +1036,7 @@ VKAPI_ATTR void VKAPI_CALL lsl_DestroyDevice(VkDevice dev,
 
 VKAPI_ATTR void VKAPI_CALL lsl_GetDeviceQueue(VkDevice dev, uint32_t family,
                                               uint32_t index, VkQueue *queue) {
-    static PFN_vkGetDeviceQueue next;
-    if (!next) next = (PFN_vkGetDeviceQueue)g_next_gdpa(dev, "vkGetDeviceQueue");
+    PFN_vkGetDeviceQueue next = (PFN_vkGetDeviceQueue)dev_gdpa(dev)(dev, "vkGetDeviceQueue");
     if (!next) return;
     next(dev, family, index, queue);
     if (queue) note_queue(*queue, family);
