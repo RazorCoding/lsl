@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -189,6 +190,8 @@ private:
     void onLayerDirChanged();
     void onApplyClicked();
     void onLaunchClicked();
+    void onCheckSetupClicked();
+    void onViewLogClicked();
 
     // display
     void selectIndex(size_t index);
@@ -226,6 +229,8 @@ private:
     Gtk::Label* configNote_ = nullptr;
     Gtk::Button* apply_ = nullptr;
     Gtk::Button* launch_ = nullptr;
+    Gtk::Button* checkSetup_ = nullptr;
+    Gtk::Button* viewLog_ = nullptr;
     Gtk::Label* status_ = nullptr;
 
     std::vector<lsl::SteamGame> games_;
@@ -446,8 +451,19 @@ void Window::buildWidgets() {
     launch_ = Gtk::make_managed<Gtk::Button>("Launch game");
     launch_->set_tooltip_text("Ask Steam to start this game (steam -applaunch).");
     launch_->signal_clicked().connect([this] { onLaunchClicked(); });
+    checkSetup_ = Gtk::make_managed<Gtk::Button>("Check setup");
+    checkSetup_->set_tooltip_text(
+        "Diagnose the install: is the layer where the loader can find it, "
+        "is the profile saved, is Steam running?");
+    checkSetup_->signal_clicked().connect([this] { onCheckSetupClicked(); });
+    viewLog_ = Gtk::make_managed<Gtk::Button>("View log");
+    viewLog_->set_tooltip_text(
+        "Open the layer's log file (set LSL_LAYER_LOG to enable logging).");
+    viewLog_->signal_clicked().connect([this] { onViewLogClicked(); });
     buttons->append(*apply_);
     buttons->append(*launch_);
+    buttons->append(*checkSetup_);
+    buttons->append(*viewLog_);
     details->append(*buttons);
 
     details->append(*Gtk::make_managed<Gtk::Separator>(
@@ -865,6 +881,83 @@ void Window::onLaunchClicked() {
         }
     } catch (const Glib::Error& error) {
         setStatus(std::string("Could not run Steam: ") + error.what(), true);
+    }
+}
+
+void Window::onCheckSetupClicked() {
+    std::ostringstream r;
+    bool ok = true;
+
+    if (layerIsImplicit()) {
+        r << "Layer: implicit (loader loads it into every Vulkan process)\n";
+        r << "  manifest: " << implicitManifest_ << "\n";
+    } else if (layerDirLooksRight()) {
+        r << "Layer: explicit (must be in Steam launch options)\n";
+        r << "  manifest: " << layerEntry_->get_text() << "/VkLayer_lsl_frame.json\n";
+    } else {
+        r << "Layer: NOT FOUND - no VkLayer_lsl_frame.json anywhere the GUI looked.\n";
+        r << "  fix: run tools/install-layer.sh (add --implicit for the no-launch-options mode).\n";
+        ok = false;
+    }
+
+    std::error_code ec;
+    if (fs::is_regular_file(profilePath_, ec)) {
+        r << "Profile store: " << profilePath_ << "\n";
+    } else {
+        r << "Profile store: MISSING (" << profilePath_ << ") - cannot save.\n";
+        ok = false;
+    }
+
+    if (steamRunning()) {
+        r << "Steam: running.\n";
+    } else {
+        r << "Steam: not running (launch options and steam -applaunch need it).\n";
+    }
+
+    const lsl::SteamGame* g = current();
+    if (g) {
+        r << "Selected game: " << g->name << " (appid " << g->appid << ").\n";
+        r << "  enabled in profile: " << (enable_->get_active() ? "yes" : "no")
+          << ", scale " << scale_->get_value() << ", method "
+          << selectedMethod() << ".\n";
+    } else {
+        r << "No game selected.\n";
+    }
+
+    r << "\n";
+    if (ok) {
+        r << "Setup looks OK. To prove it works: set LSL_LAYER_LOG=/tmp/lsl.log, "
+             "launch the game, then \"View log\" - look for "
+             "\"scale: appid ... is enabled\" and \"upscale 1\".";
+        setStatus(r.str(), false);
+    } else {
+        setStatus(r.str(), true);
+    }
+}
+
+void Window::onViewLogClicked() {
+    const char* p = std::getenv("LSL_LAYER_LOG");
+    std::string path = (p && *p) ? p : "";
+    if (path.empty()) {
+        setStatus("Set LSL_LAYER_LOG to a file path (e.g. /tmp/lsl.log) before "
+                  "launching the game, then click this again. Logging is off "
+                  "otherwise so the layer stays silent in every other program.",
+                  true);
+        return;
+    }
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec)) {
+        setStatus("Log file not found yet: " + path +
+                      ". Launch the game once with LSL_LAYER_LOG set, then "
+                      "retry.",
+                  true);
+        return;
+    }
+    try {
+        Glib::spawn_command_line_async("xdg-open \"" + path + "\"");
+        setStatus("Opened " + path + ".", false);
+    } catch (const Glib::Error& e) {
+        setStatus("Could not open the log: " + std::string(e.what()), true);
     }
 }
 
