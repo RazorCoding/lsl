@@ -1,6 +1,6 @@
 # Maintainer: RazorCoding <https://github.com/RazorCoding>
 pkgname=lsl
-pkgver=r21.8fc8f25
+pkgver=r24.a437466
 
 pkgrel=1
 pkgdesc="Lossless Scaling-style Linux Vulkan compute upscaler + GTK4 GUI (per-game profiles, implicit layer)"
