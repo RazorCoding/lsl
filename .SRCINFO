@@ -1,6 +1,6 @@
 pkgbase = lsl
 	pkgdesc = Lossless Scaling-style Linux Vulkan compute upscaler + GTK4 GUI (per-game profiles, implicit layer)
-	pkgver = r18.79a70bb
+	pkgver = r21.8fc8f25
 	pkgrel = 1
 	url = https://github.com/RazorCoding/lsl
 	arch = x86_64
