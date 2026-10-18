@@ -1022,14 +1022,14 @@ VKAPI_ATTR void VKAPI_CALL lsl_DestroyDevice(VkDevice dev,
      * chain, which can belong to a frame-generation layer's helper device and
      * make the forward below skip that layer's teardown -- leaking its objects. */
     PFN_vkGetDeviceProcAddr gdpa = dev_gdpa(dev);
-    /* Original behavior: clear all chains.  Per-device filtering was
-     * attempted but QueueEntry has no dev field; the memset is restored
-     * because the crash investigation showed the issue is the static function
-     * pointers, not the chain clearing. */
-    /* Clear only this device's chains and queues, not other devices'. */
+    /* Drop only the chains and queues this device owned.  The chain has to be
+     * zeroed, not just have its VkSwapchainKHR cleared: chain_alloc() treats a
+     * null sc as a free slot and does not reset the rest, so a leftover
+     * have_images/images[] from this swapchain would be handed to the next one
+     * and presented from images this device already tore down. */
     for (int i = 0; i < LSL_MAX_SWAPCHAINS; ++i)
         if (g_chains[i].sc != VK_NULL_HANDLE && g_chains[i].dev == dev)
-            g_chains[i].sc = VK_NULL_HANDLE;
+            memset(&g_chains[i], 0, sizeof(g_chains[i]));
     int nq = 0;
     for (int i = 0; i < g_queue_count; ++i)
         if (g_queues[i].dev != dev) g_queues[nq++] = g_queues[i];
@@ -1086,7 +1086,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
      * how big the surface really is.  Resolve it through the swapchain's own
      * device here too, so the resize does not silently depend on call order. */
     VkPhysicalDevice pd = lsl_pd_of_dev(dev);
-    if (pd == VK_NULL_HANDLE) pd = lsl_pd_of_dev(dev);
+    if (pd == VK_NULL_HANDLE) pd = g_physdev;
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR get_caps = caps_entry(pd);
 
     if (scaling() && lsl_format_supported(ci->imageFormat) && get_caps &&
