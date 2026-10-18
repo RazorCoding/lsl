@@ -277,15 +277,15 @@ void Window::buildWidgets() {
 
     auto css = Gtk::CssProvider::create();
     css->load_from_string(
-        ".lsl-error { color: #ff6b6b; }\n"
+        ".lsl-error { color: #c01c28; }\n"
         ".lsl-section { font-weight: 700; font-size: 1.05em; margin-top: 10px; }\n"
-        ".lsl-dim { color: #9aa0a6; font-size: 0.9em; }\n"
-        "window { background-color: #1e1e2e; color: #e0e0e0; }\n"
-        ".title { font-weight: 700; font-size: 1.3em; color: #cdd6f4; }\n"
-        "button { background: #313244; color: #cdd6f4; border: 1px solid #45475a; }\n"
-        "button:hover { background: #45475a; }\n"
-        "entry, spinbutton { background: #313244; color: #cdd6f4; }\n"
-        "listview, listbox { background: #181825; }\n");
+        ".lsl-dim { color: #5e5c64; font-size: 0.9em; }\n"
+        "window { background-color: #fafafa; color: #1e1e2e; }\n"
+        ".title { font-weight: 700; font-size: 1.3em; color: #1e1e2e; }\n"
+        "button { background: #ffffff; color: #1e1e2e; border: 1px solid #c0c0c0; }\n"
+        "button:hover { background: #e8e8e8; }\n"
+        "entry, spinbutton { background: #ffffff; color: #1e1e2e; }\n"
+        "listview, listbox { background: #ffffff; }\n");
     if (auto display = Gdk::Display::get_default()) {
         Gtk::StyleProvider::add_provider_for_display(
             display, css, GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -1036,8 +1036,10 @@ void Window::onInstallLayerClicked() {
     candidates.push_back("/usr/local/share/lsl/tools/install-layer.sh");
     candidates.push_back(std::string(std::getenv("HOME") ? std::getenv("HOME") : "") +
                          "/.local/share/lsl/tools/install-layer.sh");
-    // The dev tree, if still present.
-    candidates.push_back("/home/Gnana/Code/lsl/tools/install-layer.sh");
+    // The dev tree, if LSL_SOURCE_DIR points at it.
+    if (const char* sd = std::getenv("LSL_SOURCE_DIR"); sd && *sd) {
+        candidates.push_back(std::string(sd) + "/tools/install-layer.sh");
+    }
 
     std::string script;
     for (const auto& c : candidates) {
