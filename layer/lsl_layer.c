@@ -115,10 +115,18 @@ static struct {
 } g_pds[LSL_MAX_PDS];
 static int g_pd_count;
 
+typedef struct NextDevice_s {
+    PFN_vkQueuePresentKHR present;
+    PFN_vkCreateSwapchainKHR create_swapchain;
+    PFN_vkDestroySwapchainKHR destroy_swapchain;
+    PFN_vkGetSwapchainImagesKHR get_swapchain_images;
+} NextDevice;
+
 static struct {
     VkDevice dev;
     VkPhysicalDevice pd;
     PFN_vkGetDeviceProcAddr gdpa;
+    NextDevice next;
 } g_devs[LSL_MAX_DEVS];
 static int g_dev_count;
 
@@ -185,12 +193,14 @@ static void note_device(VkDevice dev, VkPhysicalDevice pd,
         if (g_devs[i].dev == dev) {
             g_devs[i].pd = pd;
             g_devs[i].gdpa = gdpa;
+            memset(&g_devs[i].next, 0, sizeof(NextDevice));
             return;
         }
     if (g_dev_count >= LSL_MAX_DEVS) return;
     g_devs[g_dev_count].dev = dev;
     g_devs[g_dev_count].pd = pd;
     g_devs[g_dev_count].gdpa = gdpa;
+    memset(&g_devs[g_dev_count].next, 0, sizeof(NextDevice));
     g_dev_count++;
 }
 
@@ -209,6 +219,16 @@ static PFN_vkGetDeviceProcAddr dev_gdpa(VkDevice dev) {
     for (int i = 0; i < g_dev_count; ++i)
         if (g_devs[i].dev == dev) return g_devs[i].gdpa;
     return g_next_gdpa;
+}
+
+/* Per-device cached next-chain entry points.  Using a global cache (as the
+ * original code did) is unsafe when multiple devices exist: the second device
+ * overwrites the cache and the first device ends up calling entry points from
+ * the wrong chain, which can crash. */
+static NextDevice *dev_next(VkDevice dev) {
+    for (int i = 0; i < g_dev_count; ++i)
+        if (g_devs[i].dev == dev) return &g_devs[i].next;
+    return NULL;
 }
 
 static void forget_device(VkDevice dev) {
@@ -454,14 +474,6 @@ static uint32_t family_of_queue(VkQueue q) {
 
 /* ---------------------------------------------------------- device entry pts */
 
-typedef struct {
-    PFN_vkQueuePresentKHR present;
-    PFN_vkCreateSwapchainKHR create_swapchain;
-    PFN_vkDestroySwapchainKHR destroy_swapchain;
-    PFN_vkGetSwapchainImagesKHR get_swapchain_images;
-} NextDevice;
-
-static NextDevice g_next;
 
 /* Every next-chain entry point the injected passes need, resolved once at device
  * creation.  Resolving once keeps dozens of GetDeviceProcAddr calls out of
@@ -1009,11 +1021,14 @@ VKAPI_ATTR void VKAPI_CALL lsl_DestroyDevice(VkDevice dev,
      * chain, which can belong to a frame-generation layer's helper device and
      * make the forward below skip that layer's teardown -- leaking its objects. */
     PFN_vkGetDeviceProcAddr gdpa = dev_gdpa(dev);
-    forget_device(dev);
+    /* Original behavior: clear all chains.  Per-device filtering was
+     * attempted but QueueEntry has no dev field; the memset is restored
+     * because the crash investigation showed the issue is the static function
+     * pointers, not the chain clearing. */
     memset(g_chains, 0, sizeof(g_chains));
     memset(g_queues, 0, sizeof(g_queues));
     g_queue_count = 0;
-    g_device = VK_NULL_HANDLE;
+    forget_device(dev);
     if (!gdpa) return;
     PFN_vkDestroyDevice next = (PFN_vkDestroyDevice)gdpa(dev, "vkDestroyDevice");
     if (next) next(dev, ac);
@@ -1031,8 +1046,7 @@ VKAPI_ATTR void VKAPI_CALL lsl_GetDeviceQueue(VkDevice dev, uint32_t family,
 VKAPI_ATTR void VKAPI_CALL lsl_GetDeviceQueue2(VkDevice dev,
                                                const VkDeviceQueueInfo2 *info,
                                                VkQueue *queue) {
-    static PFN_vkGetDeviceQueue2 next;
-    if (!next) next = (PFN_vkGetDeviceQueue2)g_next_gdpa(dev, "vkGetDeviceQueue2");
+    PFN_vkGetDeviceQueue2 next = (PFN_vkGetDeviceQueue2)dev_gdpa(dev)(dev, "vkGetDeviceQueue2");
     if (!next) return;
     next(dev, info, queue);
     if (queue && info) note_queue(*queue, info->queueFamilyIndex);
@@ -1045,9 +1059,11 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
                                                       const VkSwapchainCreateInfoKHR *ci,
                                                       const VkAllocationCallbacks *ac,
                                                       VkSwapchainKHR *out) {
-    if (!g_next.create_swapchain)
-        g_next.create_swapchain = (PFN_vkCreateSwapchainKHR)g_next_gdpa(dev, "vkCreateSwapchainKHR");
-    if (!g_next.create_swapchain) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    NextDevice *nd = dev_next(dev);
+    if (!nd) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!nd->create_swapchain)
+        nd->create_swapchain = (PFN_vkCreateSwapchainKHR)dev_gdpa(dev)(dev, "vkCreateSwapchainKHR");
+    if (!nd->create_swapchain) return VK_ERROR_EXTENSION_NOT_PRESENT;
 
     VkSwapchainCreateInfoKHR local = *ci;
     const int want_copy = capture_enabled() || scaling();
@@ -1065,7 +1081,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
      * how big the surface really is.  Resolve it through the swapchain's own
      * device here too, so the resize does not silently depend on call order. */
     VkPhysicalDevice pd = lsl_pd_of_dev(dev);
-    if (pd == VK_NULL_HANDLE) pd = g_physdev;
+    if (pd == VK_NULL_HANDLE) pd = lsl_pd_of_dev(dev);
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR get_caps = caps_entry(pd);
 
     if (scaling() && lsl_format_supported(ci->imageFormat) && get_caps &&
@@ -1146,7 +1162,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
         }
     }
 
-    VkResult r = g_next.create_swapchain(dev, &local, ac, out);
+    VkResult r = nd->create_swapchain(dev, &local, ac, out);
     if (r != VK_SUCCESS && want_upscale) {
         /* The surface can have resized between the capability query and now, or
          * the driver can simply refuse the larger extent.  Losing the upscale is
@@ -1162,7 +1178,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
         want_upscale = 0;
         real_w = ci->imageExtent.width;
         real_h = ci->imageExtent.height;
-        r = g_next.create_swapchain(dev, &local, ac, out);
+        r = nd->create_swapchain(dev, &local, ac, out);
     }
 
     if (r == VK_SUCCESS) {
@@ -1192,20 +1208,23 @@ VKAPI_ATTR void VKAPI_CALL lsl_DestroySwapchainKHR(VkDevice dev, VkSwapchainKHR 
      * layer submitted after it at present time, which reads these images. */
     if (c && c->upscale && c->dev == lsl_upscale_device()) lsl_upscale_drain();
     chain_forget(sc);
-    if (!g_next.destroy_swapchain)
-        g_next.destroy_swapchain = (PFN_vkDestroySwapchainKHR)g_next_gdpa(dev, "vkDestroySwapchainKHR");
-    if (g_next.destroy_swapchain) g_next.destroy_swapchain(dev, sc, ac);
+    NextDevice *nd = dev_next(dev);
+    if (nd && !nd->destroy_swapchain)
+        nd->destroy_swapchain = (PFN_vkDestroySwapchainKHR)dev_gdpa(dev)(dev, "vkDestroySwapchainKHR");
+    if (nd && nd->destroy_swapchain) nd->destroy_swapchain(dev, sc, ac);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL lsl_GetSwapchainImagesKHR(VkDevice dev,
                                                          VkSwapchainKHR sc,
                                                          uint32_t *count,
                                                          VkImage *images) {
-    if (!g_next.get_swapchain_images)
-        g_next.get_swapchain_images = (PFN_vkGetSwapchainImagesKHR)g_next_gdpa(dev, "vkGetSwapchainImagesKHR");
-    if (!g_next.get_swapchain_images) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    NextDevice *nd = dev_next(dev);
+    if (!nd) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    if (!nd->get_swapchain_images)
+        nd->get_swapchain_images = (PFN_vkGetSwapchainImagesKHR)dev_gdpa(dev)(dev, "vkGetSwapchainImagesKHR");
+    if (!nd->get_swapchain_images) return VK_ERROR_EXTENSION_NOT_PRESENT;
 
-    VkResult r = g_next.get_swapchain_images(dev, sc, count, images);
+    VkResult r = nd->get_swapchain_images(dev, sc, count, images);
     if (r == VK_SUCCESS && images != NULL) {
         Chain *c = chain_for(sc);
         if (c) {
@@ -1296,11 +1315,23 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_QueuePresentKHR(VkQueue queue, const VkPresen
                 (unsigned long long)g_present_count);
     }
 
-    if (!g_next.present) {
+    PFN_vkQueuePresentKHR present_fn = NULL;
+    NextDevice *nd = NULL;
+    if (c && c->dev) nd = dev_next(c->dev);
+    if (nd && nd->present) present_fn = nd->present;
+    else if (nd) {
+        nd->present = (PFN_vkQueuePresentKHR)dev_gdpa(c->dev)(c->dev, "vkQueuePresentKHR");
+        present_fn = nd->present;
+    }
+    if (!present_fn && g_dev_count > 0) {
+        /* Fall back to the first known device's chain. */
+        present_fn = (PFN_vkQueuePresentKHR)g_devs[0].gdpa(g_devs[0].dev, "vkQueuePresentKHR");
+    }
+    if (!present_fn) {
         lsl_log("vkQueuePresentKHR: the next layer/ICD has no present entry point");
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    return g_next.present(queue, pi);
+    return present_fn(queue, pi);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL lsl_GetDeviceProcAddr(VkDevice dev, const char *name);
@@ -1325,22 +1356,15 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL lsl_GetDeviceProcAddr(VkDevice dev, con
     if (!name) return NULL;
     if (!g_next_gdpa) return NULL;
     if (!strcmp(name, "vkQueuePresentKHR")) {
-        if (!g_next.present) g_next.present = (PFN_vkQueuePresentKHR)g_next_gdpa(dev, name);
         return (PFN_vkVoidFunction)lsl_QueuePresentKHR;
     }
     if (!strcmp(name, "vkCreateSwapchainKHR")) {
-        if (!g_next.create_swapchain)
-            g_next.create_swapchain = (PFN_vkCreateSwapchainKHR)g_next_gdpa(dev, name);
         return (PFN_vkVoidFunction)lsl_CreateSwapchainKHR;
     }
     if (!strcmp(name, "vkDestroySwapchainKHR")) {
-        if (!g_next.destroy_swapchain)
-            g_next.destroy_swapchain = (PFN_vkDestroySwapchainKHR)g_next_gdpa(dev, name);
         return (PFN_vkVoidFunction)lsl_DestroySwapchainKHR;
     }
     if (!strcmp(name, "vkGetSwapchainImagesKHR")) {
-        if (!g_next.get_swapchain_images)
-            g_next.get_swapchain_images = (PFN_vkGetSwapchainImagesKHR)g_next_gdpa(dev, name);
         return (PFN_vkVoidFunction)lsl_GetSwapchainImagesKHR;
     }
     if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)lsl_DestroyDevice;
