@@ -169,6 +169,10 @@ int lsl_upscale_run(VkQueue queue, uint32_t family, VkImage image,
 
 void lsl_upscale_end(void);
 
+/* Wait for the frames already handed to the queue.  Called before the images a
+ * submitted dispatch reads can go away -- vkDestroySwapchainKHR. */
+void lsl_upscale_drain(void);
+
 /* ------------------------------------------------------------------ formats */
 
 int lsl_format_supported(VkFormat f);

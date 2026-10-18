@@ -227,6 +227,19 @@ add_test(NAME layer-upscale
                  ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(layer-upscale PROPERTIES SKIP_RETURN_CODE 77)
 
+# The layer's other half: a swapchain that is recreated rather than presented
+# once.  The harness is the smallest WSI program that recreates -- oldSwapchain
+# set, the previous swapchain destroyed right after, a different extent each
+# time, frames still in flight -- and the script requires the four things
+# upscale-check.sh cannot see: every recreated swapchain upscaled, the
+# extent-only rebuild taken, a frame dumped *after* a recreate matching the
+# Phase 1 upscaler byte for byte, and zero validation messages.  Skips (77)
+# without a display.
+add_test(NAME layer-resize
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/resize-check.sh
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(layer-resize PROPERTIES SKIP_RETURN_CODE 77)
+
 # The GUI's launch-options logic, checked against whatever Steam installation
 # this machine actually has: every game is put through an apply/clear round
 # trip, which is the part that could damage someone's configuration.  Needs no

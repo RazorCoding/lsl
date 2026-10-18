@@ -364,7 +364,11 @@ static float upscale_sharpness(void) {
 /* ------------------------------------------------------------------- chains */
 
 #define LSL_MAX_SWAPCHAINS 4
-#define LSL_MAX_IMAGES 8
+/* Drivers return 2-5 images for a normal application, and more for mailbox or
+ * an application that asks for a deep queue.  The count is only ever a cache of
+ * what vkGetSwapchainImagesKHR returned; when a swapchain reports more than
+ * this, the extra indices are presented un-upscaled and the log says so. */
+#define LSL_MAX_IMAGES 16
 
 typedef struct {
     VkSwapchainKHR sc;
@@ -376,9 +380,16 @@ typedef struct {
     uint32_t image_count;
     VkImage images[LSL_MAX_IMAGES];
     int have_images;
+    /* Counts presents, so that when every slot is taken the stalest swapchain is
+     * the one recycled.  A window being dragged recreates its swapchain faster
+     * than a slot can be freed if the application never destroys the old ones,
+     * and recycling the one that is actually being presented would silently stop
+     * upscaling it. */
+    uint64_t used;
 } Chain;
 
 static Chain g_chains[LSL_MAX_SWAPCHAINS];
+static uint64_t g_chain_clock;
 
 static Chain *chain_for(VkSwapchainKHR sc) {
     if (sc == VK_NULL_HANDLE) return NULL;
@@ -395,9 +406,17 @@ static void chain_forget(VkSwapchainKHR sc) {
 static Chain *chain_alloc(void) {
     for (int i = 0; i < LSL_MAX_SWAPCHAINS; ++i)
         if (g_chains[i].sc == VK_NULL_HANDLE) return &g_chains[i];
-    static int rr;
-    Chain *c = &g_chains[rr];
-    rr = (rr + 1) % LSL_MAX_SWAPCHAINS;
+    /* Every slot is taken.  Recycle the least recently presented one -- with a
+     * normal application that is a swapchain that was left behind, not the one
+     * on screen. */
+    int oldest = 0;
+    for (int i = 1; i < LSL_MAX_SWAPCHAINS; ++i)
+        if (g_chains[i].used < g_chains[oldest].used) oldest = i;
+    Chain *c = &g_chains[oldest];
+    if (c->sc != VK_NULL_HANDLE)
+        lsl_log("scale: recycling the slot for swapchain %p (%ux%u): more than "
+                "%d live swapchains", (void *)c->sc, c->width, c->height,
+                LSL_MAX_SWAPCHAINS);
     memset(c, 0, sizeof(*c));
     return c;
 }
@@ -1152,6 +1171,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
         c->app_width = ci->imageExtent.width;
         c->app_height = ci->imageExtent.height;
         c->upscale = want_upscale;
+        c->used = ++g_chain_clock;
         lsl_log("vkCreateSwapchainKHR: %ux%u (application believes %ux%u, fmt %d) "
                 "on device %p%s",
                 real_w, real_h, ci->imageExtent.width, ci->imageExtent.height,
@@ -1162,6 +1182,10 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
 
 VKAPI_ATTR void VKAPI_CALL lsl_DestroySwapchainKHR(VkDevice dev, VkSwapchainKHR sc,
                                                    const VkAllocationCallbacks *ac) {
+    Chain *c = chain_for(sc);
+    /* The application waited for its own submission, not for the dispatch this
+     * layer submitted after it at present time, which reads these images. */
+    if (c && c->upscale && c->dev == lsl_upscale_device()) lsl_upscale_drain();
     chain_forget(sc);
     if (!g_next.destroy_swapchain)
         g_next.destroy_swapchain = (PFN_vkDestroySwapchainKHR)g_next_gdpa(dev, "vkDestroySwapchainKHR");
@@ -1180,6 +1204,15 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_GetSwapchainImagesKHR(VkDevice dev,
     if (r == VK_SUCCESS && images != NULL) {
         Chain *c = chain_for(sc);
         if (c) {
+            if (*count > LSL_MAX_IMAGES) {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    lsl_log("scale: a swapchain reports %u images; only the first "
+                            "%d are tracked, so presents of the others stay at "
+                            "the application's resolution", *count, LSL_MAX_IMAGES);
+                }
+            }
             c->image_count = *count < LSL_MAX_IMAGES ? *count : LSL_MAX_IMAGES;
             memcpy(c->images, images, c->image_count * sizeof(VkImage));
             c->have_images = 1;
@@ -1196,6 +1229,18 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_QueuePresentKHR(VkQueue queue, const VkPresen
     if (pi && pi->swapchainCount > 0 && pi->pSwapchains && pi->pImageIndices) {
         c = chain_for(pi->pSwapchains[0]);
         index = pi->pImageIndices[0];
+        if (c) c->used = ++g_chain_clock;
+        if (pi->swapchainCount > 1) {
+            /* One present can name several swapchains.  Only the first is
+             * upscaled: the others would each need their own engine pass, and
+             * nothing here has been seen to use more than one. */
+            static int warned_many;
+            if (!warned_many) {
+                warned_many = 1;
+                lsl_log("scale: a present names %u swapchains; only the first is "
+                        "upscaled", pi->swapchainCount);
+            }
+        }
     }
 
     const int have_frame = c && c->have_images && index < c->image_count;
@@ -1213,6 +1258,16 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_QueuePresentKHR(VkQueue queue, const VkPresen
         if (lsl_upscale_run(queue, family_of_queue(queue), c->images[index],
                             lsl_env_str("LSL_LAYER_DUMP")))
             g_upscaled++;
+    } else if (c && c->upscale && !c->have_images) {
+        /* The image count was asked for but never the handles, so there is no
+         * image to upscale from.  Legal but unusual: say so once rather than
+         * presenting at the application's resolution in silence. */
+        static int warned_no_images;
+        if (!warned_no_images) {
+            warned_no_images = 1;
+            lsl_log("scale: this swapchain's images were never fetched, so it is "
+                    "presented at the application's resolution");
+        }
     } else if (c && c->upscale && c->dev != lsl_upscale_device()) {
         /* The layer keeps one engine, bound to the device whose swapchain was
          * created last.  A second live device presenting from its own swapchain

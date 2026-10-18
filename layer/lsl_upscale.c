@@ -320,6 +320,89 @@ static void write_sets(void) {
     }
 }
 
+/* Nothing the engine owns may be freed while the queue is still reading it.
+ *
+ * A resize is the case that matters: the application creates the new swapchain
+ * without waiting for its own queue, so a dispatch submitted for the previous
+ * frame -- reading exactly the buffers a rebuild would free -- can still be
+ * running.  Two slots bound the wait to the frames already handed to the queue,
+ * and this happens once per resize, never per frame. */
+static void up_wait_slots(void) {
+    if (!g_up.fn.wait_for_fences) return;
+    for (int i = 0; i < UP_SLOTS; ++i) {
+        UpSlot *s = &g_up.slot[i];
+        if (!s->submitted || !s->fence) continue;
+        if (g_up.fn.wait_for_fences(up_dev(), 1, &s->fence, VK_TRUE,
+                                    2000000000ull) != VK_SUCCESS)
+            lsl_log("scale: the queue did not drain before the upscaler was rebuilt");
+        s->submitted = 0;
+    }
+}
+
+/* The only extent-sized objects: each slot's two planes and the staging buffer
+ * the dump reads through.  Everything else -- pipelines, descriptor sets, the
+ * command pool -- is extent-independent, which is what makes a resize cheap.
+ * The caller calls write_sets() once the descriptor sets exist. */
+static void up_free_planes(void) {
+    for (int i = 0; i < UP_SLOTS; ++i) {
+        UpSlot *s = &g_up.slot[i];
+        free_buffer(s->in, s->in_mem);
+        free_buffer(s->mid, s->mid_mem);
+        s->in = VK_NULL_HANDLE;
+        s->in_mem = VK_NULL_HANDLE;
+        s->mid = VK_NULL_HANDLE;
+        s->mid_mem = VK_NULL_HANDLE;
+    }
+    free_buffer(g_up.stage, g_up.stage_mem);
+    g_up.stage = VK_NULL_HANDLE;
+    g_up.stage_mem = VK_NULL_HANDLE;
+}
+
+static int up_make_planes(void) {
+    for (int i = 0; i < UP_SLOTS; ++i) {
+        UpSlot *s = &g_up.slot[i];
+        /* `in` is copied into (TRANSFER_DST), copied out of for the dump and the
+         * copy back (TRANSFER_SRC), and read and written by the shaders.  `mid`
+         * is only ever touched by the shaders. */
+        if (!make_buffer(g_up.plane_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->in, &s->in_mem))
+            return 0;
+        if (!make_buffer(g_up.plane_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->mid, &s->mid_mem))
+            return 0;
+    }
+    if (!make_buffer(g_up.stage_easu_off + g_up.plane_bytes,
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     &g_up.stage, &g_up.stage_mem))
+        return 0;
+    return 1;
+}
+
+/* The buffers of a given extent plus the descriptor writes that name them.
+ * Separate from up_make_planes() only because the rebuild path runs with the
+ * descriptor sets already in place, while the first build creates them first and
+ * writes them here. */
+static int up_make_buffers(void) {
+    if (!up_make_planes()) return 0;
+    write_sets();
+    return 1;
+}
+
+/* Wait for whatever the queue has not finished yet.
+ *
+ * The application must wait for its own submission before it destroys a
+ * swapchain, but the dispatch this layer submits at present time does not
+ * belong to that submission: it is queued after it, so it can still be reading
+ * the images of the swapchain being destroyed.  Called from
+ * vkDestroySwapchainKHR, and only for a swapchain this layer upscaled -- a
+ * resize rarely needs it (the rebuild already drained), but an application that
+ * destroys without recreating first does. */
+void lsl_upscale_drain(void) { up_wait_slots(); }
+
 void lsl_upscale_end(void) {
     /* The engine's objects may belong to a device that is not the newest one
      * (see Upscale.dev), so destroy them with their own device handle. */
@@ -328,13 +411,12 @@ void lsl_upscale_end(void) {
         memset(&g_up, 0, sizeof(g_up));
         return;
     }
+    up_wait_slots();
+    up_free_planes();
     for (int i = 0; i < UP_SLOTS; ++i) {
         UpSlot *s = &g_up.slot[i];
-        free_buffer(s->in, s->in_mem);
-        free_buffer(s->mid, s->mid_mem);
         if (s->fence && g_up.fn.destroy_fence) g_up.fn.destroy_fence(dev, s->fence, NULL);
     }
-    free_buffer(g_up.stage, g_up.stage_mem);
     if (g_up.dpool && g_up.fn.destroy_descriptor_pool)
         g_up.fn.destroy_descriptor_pool(dev, g_up.dpool, NULL);
     if (g_up.pool && g_up.fn.destroy_command_pool)
@@ -355,6 +437,17 @@ static int same_shape(const LslUpscaleShape *a, const LslUpscaleShape *b) {
            a->real_h == b->real_h && a->app_w == b->app_w && a->app_h == b->app_h;
 }
 
+/* The engine's command pool and its barriers are tied to one queue family, so a
+ * swapchain whose surface presents from another family needs a full rebuild
+ * rather than the extent-only path. */
+static int surface_family_matches(VkDevice dev, VkSurfaceKHR surface) {
+    if (surface == VK_NULL_HANDLE) return 1;
+    VkPhysicalDevice pd = lsl_pd_of_dev(dev);
+    if (pd == VK_NULL_HANDLE) pd = g_physdev;
+    if (pd == VK_NULL_HANDLE) return 0;
+    return pick_queue_family(pd, surface) == g_up.family;
+}
+
 VkDevice lsl_upscale_device(void) { return g_up.valid ? g_up.dev : VK_NULL_HANDLE; }
 
 int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevice dev) {
@@ -369,10 +462,41 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     }
     if (g_up.valid && g_up.dev == dev && same_shape(&g_up.shape, shape)) return 1;
 
-    /* A different device means the old engine (pipelines, buffers, command
-     * pools) cannot be reused here.  Drop it -- with its own device handle --
-     * and build again.  A process with more than one live device gets one
-     * engine at a time, which is the single-device limit noted in lsl_layer.c. */
+    /* Same device, same pixel format, and the same present queue family: a
+     * resize, and nothing else.  The pipelines, descriptor sets and command
+     * buffers do not depend on the extent, so keep them and rebuild only the
+     * buffers.  A window being dragged then costs one buffer set per resize
+     * instead of a whole pipeline build -- and, more importantly, the rebuild
+     * waits for the frames still in flight on the queue before it frees
+     * anything, which a resize does not otherwise make the application do. */
+    if (g_up.valid && g_up.dev == dev &&
+        g_up.is16 == (lsl_format_is_16f(shape->format) != 0) &&
+        g_up.texel == lsl_format_texel_bytes(shape->format) &&
+        surface_family_matches(dev, surface)) {
+        up_wait_slots();
+        g_up.shape = *shape;
+        g_up.plane_bytes = (VkDeviceSize)shape->real_w * shape->real_h * g_up.texel;
+        g_up.stage_out_off = (VkDeviceSize)shape->app_w * shape->app_h * g_up.texel;
+        g_up.stage_easu_off = g_up.stage_out_off + g_up.plane_bytes;
+        g_up.next_slot = 0;
+        up_free_planes();
+        if (!up_make_buffers()) {
+            lsl_log("scale: could not size the upscaler's buffers for %ux%u -> %ux%u; "
+                    "the application will render at full size",
+                    shape->app_w, shape->app_h, shape->real_w, shape->real_h);
+            lsl_upscale_end();
+            return 0;
+        }
+        lsl_log("scale: resized to %ux%u -> %ux%u (pipelines kept)",
+                shape->app_w, shape->app_h, shape->real_w, shape->real_h);
+        return 1;
+    }
+
+    /* A different device (or a different pixel format) means the old engine --
+     * pipelines, buffers, command pools -- cannot be reused here.  Drop it,
+     * with its own device handle, and build again.  A process with more than one
+     * live device gets one engine at a time, which is the single-device limit
+     * noted in lsl_layer.c. */
     lsl_upscale_end();
 
     /* `dev`'s own chain, not whichever device was created last. */
@@ -453,35 +577,6 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     if (!g_up.pipe_easu) UP_FAIL("EASU compute pipeline");
     if (!g_up.pipe_rcas) UP_FAIL("RCAS compute pipeline");
 
-    for (int i = 0; i < UP_SLOTS; ++i) {
-        UpSlot *s = &g_up.slot[i];
-        /* `in` is copied into (TRANSFER_DST), copied out of for the dump and the
-         * copy back (TRANSFER_SRC), and read and written by the shaders.  `mid`
-         * is only ever touched by the shaders. */
-        if (!make_buffer(g_up.plane_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->in, &s->in_mem))
-            UP_FAIL("device-local source buffer");
-        if (!make_buffer(g_up.plane_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->mid, &s->mid_mem))
-            UP_FAIL("device-local scratch buffer");
-
-        VkFenceCreateInfo fci;
-        memset(&fci, 0, sizeof(fci));
-        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        UP_CHECK(g_up.fn.create_fence(up_dev(), &fci, NULL, &s->fence), "create_fence");
-    }
-
-    /* Host-visible staging: the app's frame, then the upscaled frame, written
-     * only on the frame that is dumped. */
-    if (!make_buffer(g_up.stage_easu_off + g_up.plane_bytes,
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                     &g_up.stage, &g_up.stage_mem))
-        UP_FAIL("host-visible staging buffer");
-
     VkDescriptorPoolSize dps;
     memset(&dps, 0, sizeof(dps));
     dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -511,6 +606,18 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     UP_CHECK(g_up.fn.allocate_descriptor_sets(up_dev(), &dsai, sets), "allocate RCAS sets");
     for (int i = 0; i < UP_SLOTS; ++i) g_up.slot[i].set_rcas = sets[i];
 
+    /* The descriptor sets have to exist before the buffers they name, and the
+     * extent-sized buffers before the command buffers that copy into them. */
+    if (!up_make_buffers()) UP_FAIL("the extent-sized buffers");
+
+    for (int i = 0; i < UP_SLOTS; ++i) {
+        VkFenceCreateInfo fci;
+        memset(&fci, 0, sizeof(fci));
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        UP_CHECK(g_up.fn.create_fence(up_dev(), &fci, NULL, &g_up.slot[i].fence),
+                 "create_fence");
+    }
+
     VkCommandPoolCreateInfo cpci;
     memset(&cpci, 0, sizeof(cpci));
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -531,7 +638,7 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
         lsl_stamp_command_buffers(up_dev(), 1, &g_up.slot[i].cmd);
     }
 
-    write_sets();
+    /* write_sets() already ran, for the new plane buffers. */
     g_up.valid = 1;
     lsl_log("scale: %ux%u -> %ux%u via FSR1 EASU+RCAS, %s pixels, queue family %u",
             shape->app_w, shape->app_h, shape->real_w, shape->real_h,

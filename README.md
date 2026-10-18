@@ -4,11 +4,13 @@ A from-scratch Vulkan compute upscaler for games running under Steam/Proton on
 Wayland (CachyOS/Arch + Hyprland). No code, binaries, or models are taken from
 Lossless Scaling or from `lsfg-vk`.
 
-**Current state: Phase 1 and the Phase 2 layer.** Phase 1 is the scaler core and
-its benchmark; Phase 2 is a Vulkan layer that makes a running application render
-at a fraction of the surface size and upscales the frame at present time with
-that same chain. There is no GUI, no profile management and no frame generation
-yet; the layer is injected per game by hand.
+**Current state: Phase 1, the Phase 2 layer and the Phase 3 GUI.** Phase 1 is
+the scaler core and its benchmark; Phase 2 is a Vulkan layer that makes a running
+application render at a fraction of the surface size and upscales the frame at
+present time with that same chain; Phase 3 is a GTK4 window that writes that
+layer's two environment variables into a game's Steam launch options. What is
+not built is frame generation and packaging; on a real game the layer is still
+injected by hand or through the window.
 
 ---
 
@@ -35,6 +37,8 @@ yet; the layer is injected per game by hand.
 | `src/steam.{hpp,cpp}` + `src/profile.{hpp,cpp}` | Steam discovery, in-place VDF edit, launch-options merge, per-game profiles |
 | `tests/test_steam.cpp` | 102 checks over the above, no display needed |
 | `gui/main.cpp` | `lsl-gui`: GTK4 window — game list, profile, launch options, launch button |
+| `tools/resize-check.c` | WSI harness: swapchain recreated with `oldSwapchain`, resize storms |
+| `tools/resize-check.sh` | layer gate: every recreate upscaled, extent-only rebuild, post-recreate dump matches the reference, zero validation messages |
 | Motion estimation / frame generation | **not implemented** |
 | Packaging (a distributable layer + installer) | **not implemented** |
 
@@ -48,11 +52,12 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-CTest runs six tests: the 79 CPU reference checks (`reference`), 102 checks over
-the Steam configuration core (`steam`), a `validation` test that re-runs the
+CTest runs seven tests: the 79 CPU reference checks (`reference`), 102 checks
+over the Steam configuration core (`steam`), a `validation` test that re-runs the
 scaler under the Khronos validation layers, `layer-upscale`, which loads the
 layer into `vkcube` and checks its present-time result against the Phase 1
-reference (see *Verifying the layer* below), and two GUI selftests (headless
+reference (see *Verifying the layer* below), `layer-resize`, which drives the
+layer through recreated swapchains (see *Resizing* below), and two GUI selftests (headless
 `gui-selftest`, and `gui-window-selftest`, which builds the window and skips
 itself without a display). The validation-dependent halves **skip themselves**
 unless the layers are installed:
@@ -180,6 +185,45 @@ PASS: present-time upscale matches the Phase 1 reference
 
 The same script runs for the native Wayland path with `LSL_CHECK_WSI=wayland`.
 `ctest` runs the XCB form as `layer-upscale`.
+
+### Resizing
+
+An engine does not just present a single swapchain. It also recreates it: it
+calls `vkCreateSwapchainKHR` with the previous `oldSwapchain` and a new
+`imageExtent`, and the old one is destroyed as soon as the new one exists. If
+the layer frees its buffers while a dispatch submitted after the app's
+submission is still reading them, that is a use-after-free -- exactly the
+correctness class the pixel match cannot see.
+
+`tools/resize-check.c` is a 150-line WSI harness for this: a hand-sized XCB
+window that cycles through eight sizes, creating each new swapchain from the
+previous one, keeping two frames in flight (with per-frame render-finished
+semaphores so VVL's `VUID-vkQueueSubmit-pSignalSemaphores-00067` does not
+trigger), `vkDeviceWaitIdle`ing before destroying a swapchain (for
+`VUID-vkDestroySwapchainKHR-swapchain-01282`), and painting a fixed pattern so
+the upscaler has pixels to work with. It prints `RESIZE_CHECK_OK` and exits 0 on
+success.
+
+`tools/resize-check.sh` then verifies four things:
+
+1. **every swapchain created was upscaled.** The layer logs `- upscaling` for
+   each successful `vkCreateSwapchainKHR` -- all eight are, so the lie and the
+   rebuild survive every recreate;
+2. **the extent-only path ran.** At least one line reads `resized to ... (pipelines kept)`, proving the engine rebuilt only the extent-sized buffers and did not
+   tear down pipelines or descriptor sets;
+3. **a frame dumped *after* a recreate is correct.** With `LSL_LAYER_DUMP` the
+   layer dumps the first frame it upscales. The script asserts the dumped
+   dimensions are those of a *recreated* swapchain (not the first), compares
+   against `lsl-upscale --modes fsr1rcas` byte-for-byte for 8-bit, and swaps BGRA
+   into the shader's channel order before comparing; and
+4. **zero validation messages.** With the Khronos validation layer underneath
+   the injected layer, the clean run reports nothing. As with `upscale-check.sh`,
+   a deliberate `LSL_LAYER_CAPTURE=1` + `LSL_LAYER_BREAK_LAYOUT=1` run must
+   report `VUID-VkPresentInfoKHR-pImageIndices-01430`, so silence means validation
+   looked at the layer.
+
+The resize test is also wired into `ctest` as `layer-resize` and skips (77)
+without a display.
 
 ### Layer limits (prototype)
 
