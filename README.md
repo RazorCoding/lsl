@@ -131,6 +131,7 @@ so the rest of the line can stay while scaling is off.
 | `LSL_LAYER_SCALE` | upscale factor, `2` = render at half size. Unset/`≤1` = off. Fractional values work (`1.5`, `2.5`); the app is told `trunc(real/scale)` |
 | `LSL_LAYER_SHARPNESS` | RCAS strength in stops, as in `lsl-upscale` (default 0 = AMD's setting). Only `fsr1rcas` reads it |
 | `LSL_LAYER_MODE` | which method to run: `nearest`, `bilinear`, `cubic`, `lanczos2`, `lanczos3`, `fsr1`, `fsr1rcas`, `nis`, `cnn`, or `auto`. Unset/empty = `fsr1rcas`; an unknown name logs a warning and uses `fsr1rcas` |
+| `LSL_LAYER_AI` | `auto` (default), `cnn`/`force`, or `off`; controls whether `LSL_LAYER_MODE=auto` may use the AI restoration pass |
 | `LSL_LAYER_DUMP` | prefix; writes `<prefix>.src.ppm`, `.out.ppm`, `.easu.ppm` for the **first** upscaled frame |
 | `LSL_LAYER_LOG` | where the layer's one-line-per-event log goes (nothing is logged without it) |
 | `LSL_LAYER_CAPTURE` | `1` = the Phase-1-style readback path (hash per frame), slow by design |
@@ -303,10 +304,13 @@ sampling, so the arithmetic was re-derived and both sides — the layer's
 `src/cnn_ref.cpp` — are checked against each other byte for byte. The MIT sources
 they are named after are vendored unmodified under `third_party/`.
 
-`auto` is a policy, not a method: the layer resolves it once per swapchain, from
-geometry alone (the frame it would have to inspect has already been copied by the
-time it gets there), and `lsl-upscale` rejects it because a policy has no CPU
-reference to compare against. The rule comes from measured cost and quality:
+`auto` is a policy, not a method: the layer resolves it once per swapchain from
+the Vulkan physical-device type and the geometry (the frame it would have to
+inspect has already been copied by the time it gets there). Software/CPU Vulkan
+devices never select the AI pass implicitly. `LSL_LAYER_AI=cnn` can force it on
+a real GPU, while `LSL_LAYER_AI=off` disables it. `lsl-upscale` rejects `auto`
+because a policy has no CPU reference to compare against. The rule comes from
+measured cost and quality:
 
 | method | cost at 1600×1000 → 2560×1600 | PSNR vs GT | edge (GT 3.69) |
 | --- | --- | --- | --- |
@@ -318,8 +322,9 @@ reference to compare against. The rule comes from measured cost and quality:
 There is no free lunch to hand out, so `cnn` is the one that has to be rationed,
 and by output size rather than by ratio:
 
-* destination ≤ 1280×720 → `cnn`, where it costs about 5 ms and the app is
-  rendering small enough to afford it;
+* discrete-GPU destination ≤ 1280×720 (integrated-GPU destination ≤ 960×540) →
+  `cnn`, where it costs about 5 ms and the app is rendering small enough to
+  afford it;
 * otherwise a scale ratio ≥ 1.5 → `nis`, a real downscale where sharpening
   recovers what is missing, and its milder sharpening is a better match than
   RCAS's maximum lobe (which overshoots the ground truth's edge energy);

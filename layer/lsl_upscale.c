@@ -225,10 +225,12 @@ static int mode_is_refined(uint32_t m) {
     return m == LSL_MODE_FSR1RCAS || m == LSL_MODE_NIS || m == LSL_MODE_CNN;
 }
 
-/* LSL_LAYER_MODE=auto.  The layer is asked to choose from geometry alone --
- * the frame it would have to inspect has already been copied by the time it
- * gets there -- and it makes the choice once per swapchain, because a
- * per-frame one would flicker as the picture changed.
+/* LSL_LAYER_MODE=auto.  The layer makes this choice once per swapchain, because
+ * a per-frame one would flicker as the picture changed.  The old policy used
+ * geometry alone.  That was unsafe on llvmpipe/CPU Vulkan and needlessly
+ * conservative on a real discrete GPU, so use the physical-device properties
+ * as well.  `cnn` is an AI-style learned restoration pass implemented as a
+ * Vulkan compute shader; it is not DLSS and does not require a vendor SDK.
  *
  * There is no free lunch to hand out, so the rule follows the measurements
  * (1600x1000 -> 2560x1600; dispatch cost per frame, and PSNR / edge energy
@@ -253,16 +255,43 @@ static int mode_is_refined(uint32_t m) {
  * the milder sharpening is a better match than RCAS's maximum lobe: that is
  * what nis is for.  Everything else stays on the historical default.
  */
-#define LSL_AUTO_CNN_MAX_PIXELS (1280u * 720u)
+#define LSL_AUTO_CNN_MAX_PIXELS_DISCRETE (1280u * 720u)
+#define LSL_AUTO_CNN_MAX_PIXELS_INTEGRATED (960u * 540u)
 
-static uint32_t lsl_auto_pick(uint32_t app_w, uint32_t app_h,
+static uint32_t lsl_auto_pick(VkPhysicalDevice pd, uint32_t app_w, uint32_t app_h,
                               uint32_t real_w, uint32_t real_h) {
-    if (!app_w || !app_h) return LSL_MODE_FSR1RCAS;
-    if ((uint64_t)real_w * real_h <= LSL_AUTO_CNN_MAX_PIXELS) return LSL_MODE_CNN;
+    const char *ai = lsl_env_str("LSL_LAYER_AI");
+    if (ai && (!strcmp(ai, "off") || !strcmp(ai, "0") || !strcmp(ai, "false")))
+        return LSL_MODE_FSR1RCAS;
+
+    VkPhysicalDeviceProperties props;
+    memset(&props, 0, sizeof(props));
+    PFN_vkGetPhysicalDeviceProperties get_props = NULL;
+    if (pd != VK_NULL_HANDLE)
+        get_props = (PFN_vkGetPhysicalDeviceProperties)
+            lsl_pd_proc(pd, "vkGetPhysicalDeviceProperties");
+    if (pd == VK_NULL_HANDLE || !get_props)
+        props.deviceType = VK_PHYSICAL_DEVICE_TYPE_CPU;
+    else
+        get_props(pd, &props);
+
+    const int ai_auto = !ai || !*ai || !strcmp(ai, "auto");
+    const int force_cnn = ai && (!strcmp(ai, "cnn") || !strcmp(ai, "force"));
+    const int cpu = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    const uint64_t pixels = (uint64_t)real_w * real_h;
+    const uint64_t cnn_limit = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+        ? LSL_AUTO_CNN_MAX_PIXELS_INTEGRATED
+        : LSL_AUTO_CNN_MAX_PIXELS_DISCRETE;
+
+    /* Explicit force is useful for testing and for users with a fast
+     * integrated GPU.  Never send a CPU/software Vulkan device through the
+     * CNN implicitly: it can turn a 5 ms pass into hundreds of milliseconds. */
+    if (!cpu && (force_cnn || (ai_auto && pixels <= cnn_limit)))
+        return LSL_MODE_CNN;
     const float rx = (float)real_w / (float)app_w;
     const float ry = (float)real_h / (float)app_h;
     const float ratio = rx > ry ? rx : ry;
-    if (ratio >= 1.5f) return LSL_MODE_NIS;
+    if (!cpu && ratio >= 1.5f) return LSL_MODE_NIS;
     return LSL_MODE_FSR1RCAS;
 }
 
@@ -621,11 +650,14 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
         return 0;
     }
 
+    VkPhysicalDevice pd = lsl_pd_of_dev(dev);
+    if (pd == VK_NULL_HANDLE) pd = g_physdev;
+
     /* Resolve "auto" here rather than per frame, so the choice is a property of
      * the swapchain.  See lsl_auto_pick(). */
     const int declared_auto = (shape->mode == LSL_MODE_AUTO);
     const uint32_t mode = declared_auto
-        ? lsl_auto_pick(shape->app_w, shape->app_h, shape->real_w, shape->real_h)
+        ? lsl_auto_pick(pd, shape->app_w, shape->app_h, shape->real_w, shape->real_h)
         : shape->mode;
     /* The shape carries the declared mode, so an auto engine compares equal to
      * itself on the next frame of the same swapchain. */
@@ -687,8 +719,6 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     g_up.stage_easu_off = g_up.stage_out_off + g_up.plane_bytes;
     g_up.next_slot = 0;
 
-    VkPhysicalDevice pd = lsl_pd_of_dev(dev);
-    if (pd == VK_NULL_HANDLE) pd = g_physdev;
     g_up.family = pick_queue_family(pd, surface);
     if (g_up.family == UINT32_MAX) {
         lsl_log("scale: no graphics+compute queue family to run the upscale on");

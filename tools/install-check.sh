@@ -127,10 +127,41 @@ fi
 # Negative control.  upscale-check.sh just proved the installed manifest loads;
 # this proves the *path in it* is what did the loading.  Copy the manifest with
 # a library_path that cannot exist and require that the layer stays out.
+#
+# A system-wide implicit install of lsl (the normal end-user state) would also
+# load the real layer and mask this check, so temporarily move any such manifest
+# aside for the duration of the control and restore it afterwards.
 BROKEN_DIR="${TMP}/broken"
 mkdir -p "${BROKEN_DIR}"
 sed 's#"library_path"[[:space:]]*:.*#"library_path": "/nonexistent/liblsl-layer.so",#' \
     "${MANIFEST}" >"${BROKEN_DIR}/VkLayer_lsl_frame.json"
+
+# Stash any implicit manifests we can (writable) so the negative control is
+# meaningful; a system-wide install we cannot move (no root) makes the control
+# inconclusive, in which case we skip its vkcube check rather than fail.
+STASHED=()
+SKIPPED=0
+for cand in \
+    /usr/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json \
+    /usr/local/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json \
+    /etc/vulkan/implicit_layer.d/VkLayer_lsl_frame.json \
+    "${HOME}/.local/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json" \
+    "${XDG_DATA_HOME:-}/vulkan/implicit_layer.d/VkLayer_lsl_frame.json"; do
+  [[ -z "${cand}" || "${cand}" == "/vulkan/implicit_layer.d/VkLayer_lsl_frame.json" ]] && continue
+  if [[ -f "${cand}" ]]; then
+    if mv "${cand}" "${cand}.lsl-stash" 2>/dev/null; then
+      STASHED+=("${cand}")
+    else
+      SKIPPED=1
+    fi
+  fi
+done
+restore_stash() {
+  for cand in "${STASHED[@]}"; do
+    [[ -f "${cand}.lsl-stash" ]] && mv "${cand}.lsl-stash" "${cand}"
+  done
+}
+trap restore_stash EXIT
 
 WSI="${LSL_CHECK_WSI:-xcb}"
 BROKEN_LOG="${TMP}/broken.log"
@@ -143,18 +174,27 @@ timeout 60 env \
     LSL_LAYER_SCALE=2 \
     vkcube --wsi "${WSI}" --c 2 >"${BROKEN_OUT}" 2>&1 || true
 
-if grep -q "scale:.*->.*via" "${BROKEN_LOG}" 2>/dev/null; then
-  echo "FAIL: the layer loaded from a manifest whose library_path does not exist," >&2
-  echo "      so a passing load check above proves nothing" >&2
-  exit 1
+if [[ "${SKIPPED}" -eq 1 ]]; then
+  echo "negative control: skipped (a system-wide implicit manifest could not be"
+  echo "  moved aside without root); the positive load check above is the gate"
+else
+  if grep -q "scale:.*->.*via" "${BROKEN_LOG}" 2>/dev/null; then
+    echo "FAIL: the layer loaded from a manifest whose library_path does not exist," >&2
+    echo "      so a passing load check above proves nothing" >&2
+    exit 1
+  fi
+  echo "negative control: a manifest with a bad library_path stays unloaded"
 fi
-
-echo "negative control: a manifest with a bad library_path stays unloaded"
 
 # And the property the explicit path cannot check: the installed copy also works
 # when the loader finds it on its own and the only thing that says "upscale this"
 # is SteamAppId.  appid-check.sh installs the manifest into a throwaway
 # XDG_DATA_HOME and runs the same enabled/disabled/no-appid controls.
+# Restore any stashed implicit manifests before the self-gating checks, which
+# need the real implicit layer to be findable.
+restore_stash
+trap - EXIT
+
 echo
 echo "running the self-gating checks against the installed copy"
 LSL_LAYER_DIR="${LAYER_DIR}" "${ROOT}/tools/appid-check.sh" "${BUILD_ROOT}"
