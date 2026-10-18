@@ -1,4 +1,6 @@
 #include "reference.hpp"
+#include "nis_ref.hpp"
+#include "cnn_ref.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -19,6 +21,16 @@ inline float lanczos2Weight(float x) {
     x = std::fabs(x);
     if (x >= 2.0f) return 0.0f;
     return sinc(x * 0.5f) * sinc(x);
+}
+
+// Lanczos-3: the same windowed sinc as lanczos2 with the lobe widened from 2
+// to 3. The kernel is no longer strictly positive and rings a little more, but
+// keeps more detail; it is the widest of the pure separably-filtered methods
+// here. Mirrors lanczos3Weight() in shaders/scale.comp.
+inline float lanczos3Weight(float x) {
+    x = std::fabs(x);
+    if (x >= 3.0f) return 0.0f;
+    return sinc(x * (1.0f / 3.0f)) * sinc(x);
 }
 
 inline float cubicWeight(float x) {
@@ -83,17 +95,7 @@ inline uint8_t clamp255(float v) {
 
 }  // namespace
 
-const char* modeName(uint32_t mode) {
-    switch (mode) {
-        case MODE_NEAREST:  return "nearest";
-        case MODE_BILINEAR: return "bilinear";
-        case MODE_CUBIC:    return "cubic";
-        case MODE_LANCZOS2: return "lanczos2";
-        case MODE_FSR1:     return "fsr1";
-        case MODE_FSR1RCAS: return "fsr1rcas";
-        default:            return "unknown";
-    }
-}
+// modeName()/modeLabel() live in method.hpp, next to the table they read.
 
 Image upscaleCPU(const Image& src, uint32_t dstW, uint32_t dstH, uint32_t mode,
                  float sharpness) {
@@ -105,6 +107,13 @@ Image upscaleCPU(const Image& src, uint32_t dstW, uint32_t dstH, uint32_t mode,
     // RCAS sharpening at the destination resolution.
     if (mode == MODE_FSR1)     return upscaleFSR1CPU(src, dstW, dstH);
     if (mode == MODE_FSR1RCAS) return rcasCPU(upscaleFSR1CPU(src, dstW, dstH), sharpness);
+
+    // The other two refiners sit on an EASU upscale the same way fsr1rcas does:
+    // EASU resamples, then a 1:1 pass runs at the destination resolution. The
+    // `sharpness` knob is not consulted -- the NIS USM profile and the Anime4K
+    // weights are fixed.
+    if (mode == MODE_NIS) return nisSharpenCPU(upscaleFSR1CPU(src, dstW, dstH));
+    if (mode == MODE_CNN) return anime4kRestoreCPU(upscaleFSR1CPU(src, dstW, dstH));
 
     Image out;
     out.w = dstW;
@@ -158,6 +167,22 @@ Image upscaleCPU(const Image& src, uint32_t dstW, uint32_t dstH, uint32_t mode,
                         const float wy = lanczos2Weight(fy - float(j));
                         for (int k = -1; k <= 2; ++k) {
                             const float w = wy * lanczos2Weight(fx - float(k));
+                            V3 c = fetchRef(sp, sw, sh, bx + k, by + j);
+                            r += c.r * w; g += c.g * w; b += c.b * w;
+                            wsum += w;
+                        }
+                    }
+                    if (std::fabs(wsum) > 1.0e-6f) { r /= wsum; g /= wsum; b /= wsum; }
+                    v = V3{r, g, b};
+                    break;
+                }
+
+                case MODE_LANCZOS3: {
+                    float r = 0, g = 0, b = 0, wsum = 0;
+                    for (int j = -2; j <= 3; ++j) {
+                        const float wy = lanczos3Weight(fy - float(j));
+                        for (int k = -2; k <= 3; ++k) {
+                            const float w = wy * lanczos3Weight(fx - float(k));
                             V3 c = fetchRef(sp, sw, sh, bx + k, by + j);
                             r += c.r * w; g += c.g * w; b += c.b * w;
                             wsum += w;

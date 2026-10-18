@@ -57,6 +57,7 @@
  */
 
 #include "lsl_layer.h"
+#include "lsl_method.h"
 
 #include <vulkan/vk_layer.h>
 #include <vulkan/vulkan.h>
@@ -359,6 +360,26 @@ static int scaling(void) { return upscale_scale() > 1.0f; }
 static float upscale_sharpness(void) {
     const char *e = getenv("LSL_LAYER_SHARPNESS");
     return (e && *e) ? strtof(e, NULL) : 0.0f;
+}
+
+/* LSL_LAYER_MODE names the upscaling method.  An unset or empty value keeps
+ * the historical default -- FSR1's EASU followed by RCAS -- so a launch
+ * options string written before the methods existed still means what it did.
+ * "auto" is resolved by the engine, once per swapchain.  A name the layer does
+ * not know is the default plus one warning, rather than a refusal to upscale:
+ * a typo should cost a log line, not the feature. */
+static uint32_t upscale_mode(void) {
+    static uint32_t mode;
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("LSL_LAYER_MODE");
+        uint32_t m = LSL_MODE_FSR1RCAS;
+        if (e && *e && lsl_mode_parse(e, &m) != 0)
+            lsl_log("scale: unknown LSL_LAYER_MODE=\"%s\"; using the default", e);
+        mode = m;
+    }
+    return mode;
 }
 
 /* ------------------------------------------------------------------- chains */
@@ -1109,6 +1130,7 @@ VKAPI_ATTR VkResult VKAPI_CALL lsl_CreateSwapchainKHR(VkDevice dev,
             shape.app_w = ci->imageExtent.width;
             shape.app_h = ci->imageExtent.height;
             shape.sharpness = upscale_sharpness();
+            shape.mode = upscale_mode();
             if (lsl_upscale_begin(&shape, ci->surface, dev)) {
                 local.imageExtent.width = nw;
                 local.imageExtent.height = nh;

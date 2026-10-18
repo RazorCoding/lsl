@@ -4,29 +4,22 @@
 // kept byte-for-byte equivalent to the matching shader.
 
 #include "image_io.hpp"
+#include "method.hpp"  // ScaleMode and the method name table
 
 #include <cstdint>
 
 namespace lsl {
 
-enum ScaleMode : uint32_t {
-    MODE_NEAREST  = 0,
-    MODE_BILINEAR = 1,
-    MODE_CUBIC    = 2,  // Catmull-Rom (Mitchell B=0, C=0.5)
-    MODE_LANCZOS2 = 3,
-    MODE_FSR1     = 4,  // AMD FidelityFX Super Resolution 1 (EASU), MIT
-    MODE_FSR1RCAS = 5,  // FSR1's EASU followed by its RCAS sharpening pass
-    MODE_COUNT    = 6,
-};
+// The mode ids (MODE_NEAREST .. MODE_COUNT) live in method.hpp, together with
+// the names everything else uses to talk about them.
 
 // RCAS strength in stops: 0 is the strongest lobe AMD's RCAS will apply, and
 // each whole number halves it. This matches the default AMD's own sample uses
 // (FsrRcasCon(con, 0.0)).
 constexpr float kDefaultSharpness = 0.0f;
 
-const char* modeName(uint32_t mode);
-
-// `sharpness` is only consulted by MODE_FSR1RCAS; the other modes ignore it.
+// `sharpness` is consulted by MODE_FSR1RCAS (RCAS strength, in stops); the
+// other modes ignore it.
 Image upscaleCPU(const Image& src, uint32_t dstW, uint32_t dstH, uint32_t mode,
                  float sharpness = kDefaultSharpness);
 

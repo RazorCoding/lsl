@@ -5,12 +5,14 @@ Wayland (CachyOS/Arch + Hyprland). No code, binaries, or models are taken from
 Lossless Scaling or from `lsfg-vk`.
 
 **Current state: Phase 1, the Phase 2 layer and the Phase 3 GUI.** Phase 1 is
-the scaler core and its benchmark; Phase 2 is a Vulkan layer that makes a running
-application render at a fraction of the surface size and upscales the frame at
-present time with that same chain; Phase 3 is a GTK4 window that writes that
-layer's two environment variables into a game's Steam launch options. What is
-not built is frame generation and packaging; on a real game the layer is still
-injected by hand or through the window.
+the scaler core and its benchmark — nine upscaling methods, from nearest
+neighbour through FSR1 + RCAS and NIS sharpening to Anime4K's Restore CNN.
+Phase 2 is a Vulkan layer that makes a running application render at a fraction
+of the surface size and upscales the frame at present time with any of them,
+including `auto`, which picks one per swapchain from the render size. Phase 3 is
+a GTK4 window that writes those environment variables into a game's Steam launch
+options. What is not built is frame generation and packaging; on a real game the
+layer is still injected by hand or through the window.
 
 ---
 
@@ -18,24 +20,30 @@ injected by hand or through the window.
 
 | Piece | State |
 | --- | --- |
-| `shaders/scale.comp` | nearest, bilinear, bicubic (Catmull-Rom), Lanczos-2, FSR1 EASU |
+| `shaders/scale.comp` | nearest, bilinear, bicubic (Catmull-Rom), Lanczos-2, Lanczos-3, FSR1 EASU |
 | `shaders/rcas.comp` | FSR1's RCAS sharpening pass — a second dispatch over an EASU scratch buffer |
-| `src/reference.{hpp,cpp}` | CPU implementations of the four hand-written filters, area box downsampler, PSNR/SSIM, edge energy |
+| `shaders/nis.comp` | NVIDIA Image Scaling's sharpening pass, as a second dispatch (reimplementation, MIT sources vendored) |
+| `shaders/cnn.comp` | Anime4K v4's Restore CNN, four float convolutions per pixel |
+| `src/reference.{hpp,cpp}` | CPU implementations of the hand-written filters, area box downsampler, PSNR/SSIM, edge energy |
 | `src/fsr1_ref.cpp` | CPU FSR1 EASU *and* RCAS — both compiled from AMD's own header, not re-derived |
+| `src/nis_ref.{hpp,cpp}` | CPU NVSharpen, matching `shaders/nis.comp` |
+| `src/cnn_ref.{hpp,cpp}` | CPU Anime4K Restore CNN |
 | `third_party/ffx/` | AMD's MIT `ffx_a.h` + `ffx_fsr1.h`, vendored unmodified |
+| `third_party/anime4k/` | Anime4K v4's MIT GLSL, vendored unmodified; weights baked by `tools/anime4k_weights.py` |
 | `src/lsl_vk.{hpp,cpp}` | instance/device/compute-queue, device-local + staging buffers, pipelines, GPU-timestamp timing |
 | `src/image_io.{hpp,cpp}` | PPM/PGM in, PPM out (no codec dependencies) |
 | `src/probe.cpp` | `lsl-probe`: Vulkan device inventory + env traps |
 | `src/upscale.cpp` | `lsl-upscale`: fidelity *and* quality benchmark |
-| `tests/test_reference.cpp` | 79 CPU-reference checks |
+| `tests/test_reference.cpp` | 111 CPU-reference checks |
 | `layer/lsl_layer.c` | the Vulkan layer: swapchain capture, the size lie, present interception |
-| `layer/lsl_upscale.c` | the in-layer FSR1 EASU→RCAS present engine, plus PPM dumps |
+| `layer/lsl_upscale.c` | the in-layer present engine — every method, plus PPM dumps |
+| `layer/lsl_method.{h,c}` | the layer's C copy of the method names, checked against `src/method.hpp` by `tools/upscale-check.sh` |
 | Validation layers | installable per-user without root; wired into `ctest` |
 | FSR1 `balanced` tier | EASU upscaling **and** RCAS sharpening, both landed |
 | Frame capture / layer injection | **done** — `LSL_LAYER_CAPTURE`, `LSL_LAYER_SCALE` |
-| Present-time upscaling | **done** — render at 1/scale, FSR1 back to full size |
+| Present-time upscaling | **done** — render at 1/scale, upscale back to full size |
 | `src/steam.{hpp,cpp}` + `src/profile.{hpp,cpp}` | Steam discovery, in-place VDF edit, launch-options merge, per-game profiles |
-| `tests/test_steam.cpp` | 102 checks over the above, no display needed |
+| `tests/test_steam.cpp` | 156 checks over the above, no display needed |
 | `gui/main.cpp` | `lsl-gui`: GTK4 window — game list, profile, launch options, launch button |
 | `tools/resize-check.c` | WSI harness: swapchain recreated with `oldSwapchain`, resize storms |
 | `tools/resize-check.sh` | layer gate: every recreate upscaled, extent-only rebuild, post-recreate dump matches the reference, zero validation messages |
@@ -52,7 +60,7 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-CTest runs seven tests: the 79 CPU reference checks (`reference`), 102 checks
+CTest runs seven tests: the 111 CPU reference checks (`reference`), 156 checks
 over the Steam configuration core (`steam`), a `validation` test that re-runs the
 scaler under the Khronos validation layers, `layer-upscale`, which loads the
 layer into `vkcube` and checks its present-time result against the Phase 1
@@ -76,8 +84,8 @@ deliberately *not* a dependency.
 ## Phase 2 — the layer
 
 `build/layer/liblsl-layer.so` does the whole thing inside a running application.
-It is injected through the Steam launch options (the GUI that writes these does
-not exist yet, so this is the manual form):
+It is injected through the Steam launch options; the GUI writes these, and this
+is the manual form:
 
 ```sh
 VK_ADD_LAYER_PATH=/home/you/Code/lsl/build/layer \
@@ -91,7 +99,8 @@ so the rest of the line can stay while scaling is off.
 | Variable | Meaning |
 | --- | --- |
 | `LSL_LAYER_SCALE` | upscale factor, `2` = render at half size. Unset/`≤1` = off. Fractional values work (`1.5`, `2.5`); the app is told `trunc(real/scale)` |
-| `LSL_LAYER_SHARPNESS` | RCAS strength in stops, as in `lsl-upscale` (default 0 = AMD's setting) |
+| `LSL_LAYER_SHARPNESS` | RCAS strength in stops, as in `lsl-upscale` (default 0 = AMD's setting). Only `fsr1rcas` reads it |
+| `LSL_LAYER_MODE` | which method to run: `nearest`, `bilinear`, `cubic`, `lanczos2`, `lanczos3`, `fsr1`, `fsr1rcas`, `nis`, `cnn`, or `auto`. Unset/empty = `fsr1rcas`; an unknown name logs a warning and uses `fsr1rcas` |
 | `LSL_LAYER_DUMP` | prefix; writes `<prefix>.src.ppm`, `.out.ppm`, `.easu.ppm` for the **first** upscaled frame |
 | `LSL_LAYER_LOG` | where the layer's one-line-per-event log goes (nothing is logged without it) |
 | `LSL_LAYER_CAPTURE` | `1` = the Phase-1-style readback path (hash per frame), slow by design |
@@ -112,8 +121,10 @@ The app's `WxH` image therefore lands in the top-left `WxH` corner of the real
 `NxM` image. At present time the layer:
 
 1. copies that corner into a device-local buffer,
-2. runs EASU from `WxH` to `NxM` into the scratch plane,
-3. runs RCAS into the destination plane,
+2. runs the configured method's first pass from `WxH` to `NxM` into a scratch
+   plane (EASU, Lanczos-3, nearest, …),
+3. runs the method's refinement pass, if it has one (RCAS, NIS sharpening, or
+   the CNN), into the destination plane,
 4. copies the full image back over the presented image,
 5. barriers the image to `PRESENT_SRC_KHR` and lets the present through.
 
@@ -132,14 +143,63 @@ and lies from the second one on — so the first frame is full size and later on
 are not. XWayland (and X11 generally) names the size outright and is upscaled
 from the first frame.
 
+### Methods
+
+`LSL_LAYER_MODE` names what every pass above actually is:
+
+| Method | What it runs |
+| --- | --- |
+| `nearest` | nearest neighbour |
+| `bilinear` | bilinear |
+| `cubic` | bicubic (Catmull-Rom) |
+| `lanczos2` | Lanczos-2, a 4-tap window |
+| `lanczos3` | Lanczos-3, a wider 6-tap window |
+| `fsr1` | FSR1's EASU alone |
+| `fsr1rcas` | EASU, then FSR1's RCAS sharpening — the historical default |
+| `nis` | EASU, then NVIDIA Image Scaling's sharpening |
+| `cnn` | EASU, then Anime4K v4's Restore CNN, four float convolutions per pixel |
+
+`nis` and `cnn` are reimplementations written for a storage-buffer pipeline, not
+ports: NVIDIA's `NVScaler`/`NVSharpen` and Anime4K's shaders assume texture
+sampling, so the arithmetic was re-derived and both sides — the layer's
+`shaders/nis.comp`/`cnn.comp` and the CPU reference in `src/nis_ref.cpp` /
+`src/cnn_ref.cpp` — are checked against each other byte for byte. The MIT sources
+they are named after are vendored unmodified under `third_party/`.
+
+`auto` is a policy, not a method: the layer resolves it once per swapchain, from
+geometry alone (the frame it would have to inspect has already been copied by the
+time it gets there), and `lsl-upscale` rejects it because a policy has no CPU
+reference to compare against. The rule comes from measured cost and quality:
+
+| method | cost at 1600×1000 → 2560×1600 | PSNR vs GT | edge (GT 3.69) |
+| --- | --- | --- | --- |
+| `fsr1rcas` | 1.97 ms | 35.36 dB | 4.23 |
+| `nis` | 2.87 ms | 36.05 dB | 3.01 |
+| `lanczos3` | 3.39 ms | 36.85 dB | 1.94 |
+| `cnn` | 20.0 ms (≈5 ns/px) | 36.15 dB | 2.33 |
+
+There is no free lunch to hand out, so `cnn` is the one that has to be rationed,
+and by output size rather than by ratio:
+
+* destination ≤ 1280×720 → `cnn`, where it costs about 5 ms and the app is
+  rendering small enough to afford it;
+* otherwise a scale ratio ≥ 1.5 → `nis`, a real downscale where sharpening
+  recovers what is missing, and its milder sharpening is a better match than
+  RCAS's maximum lobe (which overshoots the ground truth's edge energy);
+* otherwise → `fsr1rcas`, the historical default.
+
+The choice is per swapchain because a per-frame one would flicker as the picture
+changed, and the layer's build log line says which method it settled on
+(`… mode nis (auto)`).
+
 ### Formats
 
 Only formats the shader family can read and write are used:
-`R8G8B8A8_*`/`B8G8R8A8_*` (`_UNORM`/`_SRGB`, `lsl-upscale` drives the `fsr1rcas`
-mode) and `R16G16B16A16_SFLOAT`, which pulls a second SPIR-V variant compiled
-with `-DLSL_IO_16F`. The 16-bit variant is what Wayland's compositor normally
-hands out; XWayland usually gives an 8-bit one. Anything else logs which format
-it saw and leaves the application at full size. Both shaders are compiled with
+`R8G8B8A8_*`/`B8G8R8A8_*` (`_UNORM`/`_SRGB`, what XWayland usually gives) and
+`R16G16B16A16_SFLOAT`, which pulls a second SPIR-V variant of every shader
+compiled with `-DLSL_IO_16F`. The 16-bit variant is what Wayland's compositor
+normally hands out. Anything else logs which format it saw and leaves the
+application at full size. The shaders are compiled with
 `--target-env=vulkan1.0`, because the layer loads into applications that may not
 advertise anything newer.
 
@@ -149,25 +209,51 @@ advertise anything newer.
 runs `vkcube` with the layer loaded, and the layer dumps the source and the
 output of the first upscaled frame. The dumped source is fed through the Phase 1
 command-line upscaler — the same shaders, compiled from the same source — and
-the two images are compared:
+the two images are compared. It does this **once per method**: the list of names
+comes from `lsl-upscale --list-modes` (that is, from `src/method.hpp`'s table),
+so a method added there is exercised through the layer without anyone editing
+the script, and the layer is required to have built the method it was asked for:
 
 ```
 $ ./tools/upscale-check.sh build
 self-test: one capture pass with a deliberate wrong layout, which validation must report
 self-test: ok -- the validation layer sees the layer's commands
-running: vkcube --wsi xcb --c 5, scale 2, validation layers
-upscale: 635x775 -> 1271x1551, format 44, 8-bit pixels
-note: BGRA swapchain; comparing in the shader's channel order
-  differing bytes  : 0/5913963
+running: vkcube --wsi xcb --c 5, scale 2, mode nearest, validation layers
+nearest: 635x385 -> 1271x771 as nearest, format 44, 8-bit pixels
+comparing nearest against lsl-upscale --modes nearest:
+  differing bytes  : 0/2939823
   max channel delta: 0
   PSNR             : inf
+…
+running: vkcube --wsi xcb --c 5, scale 2, mode auto, validation layers
+auto: 635x385 -> 1271x771 as nis, format 44, 8-bit pixels
+comparing auto against lsl-upscale --modes nis:
+  differing bytes  : 0/2939823
+  max channel delta: 0
+  PSNR             : inf
+running: vkcube --wsi xcb --c 5, scale 2, the default (no LSL_LAYER_MODE), validation layers
+default: 635x385 -> 1271x771 as fsr1rcas, format 44, 8-bit pixels
+…
 validation: the layer's commands were validated, nothing reported
-PASS: present-time upscale matches the Phase 1 reference
+PASS: present-time upscale matches lsl-upscale for 11 method(s)
 ```
+
+(The `vkcube` window size — and so which method `auto` picks, `cnn` here or
+`nis` below the 1280×720 budget — depends on the compositor; the sizes above are
+from one XWayland run.)
 
 * 8-bit swapchains must match **byte for byte**. A BGRA swapchain reaches the
   shader with R and B exchanged relative to the dump's human-readable order, so
   the comparison is done in the shader's channel order.
+* **Every method is checked, and the layer must agree on the name.** The layer
+  keeps its own C copy of the vocabulary (`layer/lsl_method.{h,c}`, which cannot
+  include the C++ `src/method.hpp`), and this is what keeps the two from
+  drifting: a name the layer parses differently, or maps to the wrong filter,
+  fails the byte match.
+* **`auto` is checked too.** A policy has no CPU reference, so the method it
+  resolved to is read back out of the layer's own build line (`… mode nis
+  (auto)`) and that method's reference is used. The one run with `LSL_LAYER_MODE`
+  unset exists to pin the historical default at `fsr1rcas`.
 * 16-bit swapchains are gated on PSNR instead (55.2 dB on Wayland), because the
   dump is 8-bit and the reference therefore works from quantised input.
 * When the validation layers are installed they are loaded *underneath* the
@@ -182,6 +268,8 @@ PASS: present-time upscale matches the Phase 1 reference
   `LSL_CHECK_SELFTEST=0` skips it. This is the same trick
   `tools/validation-check.sh` uses on the Phase 1 scaler, where the thing being
   asserted on cannot prove its own absence.
+
+`LSL_CHECK_MODES=nis,cnn` checks a subset when iterating on one method.
 
 The same script runs for the native Wayland path with `LSL_CHECK_WSI=wayland`.
 `ctest` runs the XCB form as `layer-upscale`.
@@ -282,9 +370,9 @@ in the right place.
 ## Phase 3 — the GUI
 
 `lsl-gui` (GTK4) is a writer of one string. The layer's whole interface is
-`VK_ADD_LAYER_PATH` plus `LSL_LAYER_SCALE` in a game's launch options, so the
-window's job is to remember a per-game profile and splice that line into
-`localconfig.vdf`:
+`VK_ADD_LAYER_PATH` plus `LSL_LAYER_SCALE`, `LSL_LAYER_SHARPNESS` and
+`LSL_LAYER_MODE` in a game's launch options, so the window's job is to remember a
+per-game profile and splice that line into `localconfig.vdf`:
 
 ```
 ./build/lsl-gui            # or --selftest / --selftest-window, see below
@@ -293,7 +381,7 @@ window's job is to remember a per-game profile and splice that line into
 The split matters more than the window does. Everything that decides *what* to
 write — Steam root discovery, library and manifest parsing, the in-place VDF
 splice, the launch-options merge — lives in `src/steam.cpp` and `src/profile.cpp`
-with no GTK anywhere in sight, and is covered by `tests/test_steam.cpp` (102
+with no GTK anywhere in sight, and is covered by `tests/test_steam.cpp` (156
 checks). The window is a thin shell over that, which is why it is also the least
 tested part: what can be checked without a human is checked by
 `lsl-gui --selftest`, which needs no display and puts *every game in the real
@@ -307,6 +395,12 @@ layout can be reviewed from a log.
 Both are ctest tests (`gui-selftest`, `gui-window-selftest`), and the GUI target
 itself is optional: it is built only when `pkg-config` finds `gtkmm-4.0`, so the
 layer, the tools and the tests still build on a machine without GTK.
+
+A profile is a scale, a sharpness and a method. The method dropdown is built
+from `src/method.hpp`'s table — `auto` first, then every method name — so the
+strings in the window and the strings `LSL_LAYER_MODE` accepts come from one
+place; a game that has never been configured gets `auto`. Sharpness is disabled
+for any method but `fsr1rcas`, because that is the only one that reads it.
 
 Three properties are deliberate:
 
@@ -347,14 +441,18 @@ Two known limits:
 # quality needs a real image; the table below uses exactly this conversion
 ffmpeg -i ~/Pictures/wallhaven-jeeq3q.png -vf scale=1600:1000:flags=lanczos \
        -pix_fmt rgb24 /tmp/photo.ppm
-./build/lsl-upscale --in /tmp/photo.ppm --render 800x500 --bench 100  # all six modes
+./build/lsl-upscale --in /tmp/photo.ppm --render 800x500 --bench 100  # all nine modes
 
 ./build/lsl-upscale --in /tmp/photo.ppm --render 800x500 \
                     --modes fsr1rcas --sharpness 1   # RCAS strength in stops
+
+./build/lsl-upscale --list-modes                     # the names --modes takes
 ```
 
 `--device N` forces a physical device index; otherwise a discrete GPU is
-preferred. `--sharpness N` (RCAS stops) is only read by `fsr1rcas`.
+preferred. `--sharpness N` (RCAS stops) is only read by `fsr1rcas`, and `--modes
+auto` is rejected — `auto` is a run-time policy in the layer, not a filter with a
+CPU reference to score.
 
 ### Two different questions
 
@@ -387,20 +485,26 @@ A one-line example of each:
 
 ```
 mode      dispatch_avg     psnr_db  ssim          # fidelity (vs CPU reference)
-nearest      0.5244 ms      999.00  1.0000
-bilinear     0.5647 ms       89.73  1.0000
-cubic        1.2107 ms      103.11  1.0000
-lanczos2     1.7562 ms       93.05  1.0000
-fsr1         1.6142 ms       84.10  1.0000
-fsr1rcas     1.9633 ms       57.26  1.0000
+nearest      0.5369 ms      999.00  1.0000
+bilinear     0.6068 ms       89.73  1.0000
+cubic        1.1962 ms      103.11  1.0000
+lanczos2     1.7475 ms       93.05  1.0000
+fsr1         1.6165 ms       84.10  1.0000
+fsr1rcas     1.9674 ms       57.26  1.0000
+lanczos3     3.3897 ms      109.03  1.0000
+nis          2.8694 ms       81.63  1.0000
+cnn         20.0350 ms       79.41  1.0000
 
 mode      dispatch_avg   psnr_vs_gt  ssim  edge    # quality (vs original)
-nearest      0.2234 ms       34.53  0.9817  3.60
-bilinear     0.3013 ms       35.04  0.9833  1.38
-cubic        0.7795 ms       36.33  0.9878  1.79
-lanczos2     1.1282 ms       36.37  0.9879  1.78
-fsr1         0.8713 ms       35.87  0.9864  1.81
-fsr1rcas     0.9322 ms       35.36  0.9852  4.23
+nearest      0.2246 ms       34.53  0.9817  3.60
+bilinear     0.3056 ms       35.04  0.9833  1.38
+cubic        0.7909 ms       36.33  0.9878  1.79
+lanczos2     1.1017 ms       36.37  0.9879  1.78
+fsr1         0.8371 ms       35.87  0.9864  1.81
+fsr1rcas     0.8654 ms       35.36  0.9852  4.23
+lanczos3     1.3283 ms       36.85  0.9893  1.94
+nis          0.8616 ms       36.05  0.9871  3.01
+cnn          7.7980 ms       36.15  0.9875  2.33
 ```
 
 Note how the *ordering* is stable but the numbers are nothing alike — 999 dB
@@ -435,31 +539,38 @@ above. Dispatch time from GPU timestamps, 300 iterations, device-local storage.
 
 | mode | avg | p99 | PSNR vs CPU ref | SSIM | edge |
 | --- | --- | --- | --- | --- | --- |
-| nearest | 0.519 | 0.567 | 999 (bit-exact) | 1.0000 | 26.24 |
-| bilinear | 0.593 | 0.627 | 89.73 dB | 1.0000 | 13.47 |
-| cubic (Catmull-Rom) | 1.200 | 1.204 | 103.11 dB | 1.0000 | 16.00 |
-| lanczos2 | 1.755 | 1.756 | 93.05 dB | 1.0000 | 15.78 |
-| fsr1 (EASU) | 1.611 | 1.613 | 84.10 dB | 1.0000 | 17.49 |
-| fsr1rcas (EASU→RCAS) | 1.963 | 1.965 | 57.26 dB | 0.999996 | 18.34 |
+| nearest | 0.537 | 0.567 | 999 (bit-exact) | 1.0000 | 26.24 |
+| bilinear | 0.607 | 0.632 | 89.73 dB | 1.0000 | 13.47 |
+| cubic (Catmull-Rom) | 1.196 | 1.204 | 103.11 dB | 1.0000 | 16.00 |
+| lanczos2 | 1.748 | 1.749 | 93.05 dB | 1.0000 | 15.78 |
+| fsr1 (EASU) | 1.617 | 1.621 | 84.10 dB | 1.0000 | 17.49 |
+| fsr1rcas (EASU→RCAS) | 1.967 | 1.969 | 57.26 dB | 0.999996 | 18.34 |
+| lanczos3 | 3.390 | 3.415 | 109.03 dB | 1.0000 | 18.23 |
+| nis (EASU→NIS sharpen) | 2.869 | 11.209 | 81.63 dB | 1.0000 | 21.19 |
+| cnn (EASU→Anime4K CNN) | 20.035 | 20.109 | 79.41 dB | 1.0000 | 23.07 |
 
 **AMD Radeon Graphics (RADV RENOIR, iGPU)**
 
 | mode | avg | p99 | PSNR vs CPU ref | SSIM | edge |
 | --- | --- | --- | --- | --- | --- |
-| nearest | 1.004 | 1.491 | 999 (bit-exact) | 1.0000 | 26.24 |
-| bilinear | 1.046 | 1.390 | 89.73 dB | 1.0000 | 13.47 |
-| cubic (Catmull-Rom) | 2.794 | 3.667 | 999 (bit-exact) | 1.0000 | 16.00 |
-| lanczos2 | 4.617 | 6.001 | 94.03 dB | 1.0000 | 15.78 |
-| fsr1 (EASU) | 4.061 | 5.684 | 84.10 dB | 1.0000 | 17.49 |
-| fsr1rcas (EASU→RCAS) | 5.371 | 6.030 | 57.26 dB | 0.999996 | 18.34 |
+| nearest | 0.809 | 0.906 | 999 (bit-exact) | 1.0000 | 26.24 |
+| bilinear | 0.965 | 1.363 | 89.73 dB | 1.0000 | 13.47 |
+| cubic (Catmull-Rom) | 2.470 | 2.500 | 999 (bit-exact) | 1.0000 | 16.00 |
+| lanczos2 | 3.877 | 3.892 | 94.03 dB | 1.0000 | 15.78 |
+| fsr1 (EASU) | 2.867 | 2.869 | 84.10 dB | 1.0000 | 17.49 |
+| fsr1rcas (EASU→RCAS) | 3.838 | 3.983 | 57.26 dB | 0.999996 | 18.34 |
+| lanczos3 | 7.616 | 7.634 | 108.23 dB | 1.0000 | 18.23 |
+| nis (EASU→NIS sharpen) | 4.183 | 4.229 | 81.61 dB | 1.0000 | 21.19 |
+| cnn (EASU→Anime4K CNN) | 18.129 | 18.794 | 79.39 dB | 1.0000 | 23.07 |
 
 PSNR 999 is the "identical" sentinel. Every other figure is the GPU and the CPU
 reference performing the *same* arithmetic in a different order, so it measures
 remaining floating-point slack rather than filter quality: 100+ dB is a handful
 of one-level differences among millions of samples, and the 89.7 dB bilinear
 figure is simply the 8-bit rounding boundary landing on the other side for a few
-samples. FSR1 sits at 84 dB because it is the only mode whose reference is a
-literal recompile of the same source rather than a parallel port.
+samples. FSR1 sits at 84 dB because it is the only *spatial* mode whose reference
+is a literal recompile of the same source rather than a parallel port, and the
+hand-written ports sit in the same band: `nis` at 81.6 dB, `cnn` at 79.4 dB.
 
 `fsr1rcas` is lower (57 dB) and that is expected, not a defect: RCAS is a second
 pass *on top of* EASU, so every one-level disagreement EASU leaves behind is
@@ -470,11 +581,14 @@ barely moves, 17.49 → 18.34 — see the *Quality* table below, where RCAS work
 natural mid-contrast detail instead.
 
 Read the timings as: **Lanczos-2 over a 1600×1000 → 2560×1600 upscale costs
-~1.76 ms on the dGPU**, against an 8.33 ms budget at 120 Hz. FSR1 is a little
-cheaper still (1.61 ms) for a better-looking result, and the full EASU→RCAS chain
-adds ~0.35 ms (1.96 ms) — still under a quarter of the 120 Hz budget. The spatial
-tiers are affordable. The iGPU is ~1.5–3× slower and bandwidth-bound (`nearest`
-and `bilinear` cost about the same there; it has no PCIe hop but shares DRAM).
+~1.75 ms on the dGPU**, against an 8.33 ms budget at 120 Hz. FSR1 is a little
+cheaper still (1.62 ms) for a better-looking result, and the full EASU→RCAS chain
+adds ~0.35 ms (1.97 ms) — still under a quarter of the 120 Hz budget. The spatial
+tiers are affordable. The two heavyweights are not free: `nis` adds a second
+full-resolution dispatch (2.87 ms) and `cnn` four float convolutions per pixel
+(20.0 ms), which is why `auto` only reaches for `cnn` on a small destination. The
+iGPU is ~1.5–3× slower and bandwidth-bound (`nearest` and `bilinear` cost about
+the same there; it has no PCIe hop but shares DRAM).
 
 ### Quality (the number that actually ranks the filters)
 
@@ -486,25 +600,33 @@ The ground truth's own edge energy is **3.69** on the 0–255 scale.
 
 | mode | avg, GTX 1650 | avg, RADV Renoir | PSNR vs original | SSIM | edge |
 | --- | --- | --- | --- | --- | --- |
-| nearest | 0.223 | 0.311 | 34.53 dB | 0.9817 | 3.60 |
-| bilinear | 0.312 | 0.365 | 35.04 dB | 0.9833 | 1.38 |
-| cubic (Catmull-Rom) | 0.790 | 0.977 | 36.33 dB | 0.9878 | 1.79 |
-| lanczos2 | 1.084 | 1.536 | 36.37 dB | 0.9879 | 1.78 |
-| fsr1 (EASU) | 0.823 | 1.151 | 35.87 dB | 0.9864 | 1.81 |
-| fsr1rcas (EASU→RCAS) | 0.851 | 1.511 | 35.36 dB | 0.9852 | 4.23 |
+| nearest | 0.225 | 0.307 | 34.53 dB | 0.9817 | 3.60 |
+| bilinear | 0.306 | 0.355 | 35.04 dB | 0.9833 | 1.38 |
+| cubic (Catmull-Rom) | 0.791 | 0.969 | 36.33 dB | 0.9878 | 1.79 |
+| lanczos2 | 1.102 | 1.527 | 36.37 dB | 0.9879 | 1.78 |
+| fsr1 (EASU) | 0.837 | 1.129 | 35.87 dB | 0.9864 | 1.81 |
+| fsr1rcas (EASU→RCAS) | 0.865 | 1.504 | 35.36 dB | 0.9852 | 4.23 |
+| lanczos3 | 1.328 | 2.988 | 36.85 dB | 0.9893 | 1.94 |
+| nis (EASU→NIS sharpen) | 0.862 | 1.653 | 36.05 dB | 0.9871 | 3.01 |
+| cnn (EASU→Anime4K CNN) | 7.798 | 6.880 | 36.15 dB | 0.9875 | 2.33 |
 
 This is where RCAS earns its place, and where PSNR stops being useful on its own.
 Every smooth reconstruction kernel undershoots the ground truth's edge energy
-badly — bilinear 1.38, cubic 1.79, Lanczos-2 1.78, EASU alone 1.81 — because over
-a 2× upscale they can only *interpolate*; none of them can put back detail the
-downsampler removed. `nearest` sits closest (3.60) but at the cost of visible
-stair-stepping, and it has the worst PSNR of the six.
+badly — bilinear 1.38, cubic 1.79, Lanczos-2 1.78, Lanczos-3 1.94, EASU alone
+1.81 — because over a 2× upscale they can only *interpolate*; none of them can
+put back detail the downsampler removed. `nearest` sits closest (3.60) but at the
+cost of visible stair-stepping, and it has the worst PSNR of the nine.
 
 `fsr1rcas` at AMD's default strength (sharpness 0) pushes edge energy to 4.23,
 past the ground truth, and pays for it in PSNR (35.36, the lowest). RCAS is a
 sharpener, not a reconstruction kernel: it cannot recover detail either, it only
-stops the result from looking soft. The setting is therefore a trade-off, and the
-control behaves exactly as documented — each whole *stop* halves the lobe:
+stops the result from looking soft. `nis` and `cnn` sit between: `nis` sharpens
+to 3.01, closer to the ground truth's 3.69 than RCAS and with 0.7 dB more PSNR,
+and `cnn` reconstructs to 2.33 while also scoring 36.15 dB — the only method that
+both retains some sharpening and lands above every plain interpolator. `lanczos3`
+tops PSNR (36.85) but leaves edges soft (1.94). The setting is therefore a
+trade-off, and the control behaves exactly as documented — each whole *stop*
+halves the lobe:
 
 | sharpness (stops) | PSNR vs original | SSIM | edge |
 | --- | --- | --- | --- |
@@ -543,9 +665,10 @@ The *Quality* table above is the one that ranks them.
 ## Correctness gates
 
 * `nearest` must be bit-exact against the CPU reference (PSNR 999 sentinel).
-* bilinear/cubic/Lanczos-2/FSR1 must stay above 45 dB vs the CPU reference.
-  `fsr1rcas` is held to the same 45 dB gate; it measures 57 dB at 1600×1000, the
-  extra spread coming from RCAS amplifying EASU's residual one-level differences.
+* bilinear/cubic/Lanczos-2/Lanczos-3/FSR1/NIS/CNN must stay above 45 dB vs the CPU
+  reference. `fsr1rcas` is held to the same 45 dB gate; it measures 57 dB at
+  1600×1000, the extra spread coming from RCAS amplifying EASU's residual
+  one-level differences.
 * `lsl-upscale` exits non-zero if any mode fails, so this is CI-usable.
 * Verified bit-exact for `nearest` at 2×, 2.5×, 1.6×, 1.33×, 8×, 3.33×,
   1:1, and several awkward ratios, plus downscaling.
@@ -566,7 +689,7 @@ The *Quality* table above is the one that ranks them.
   that *do* hold are pinned anyway: flat colour survives to within one level at
   any scale, a step edge keeps its position, and a flat region stays at exactly
   zero edge energy at every sharpness setting.
-* Zero core-validation errors on both GPUs, for all six modes (see *Validation
+* Zero core-validation errors on both GPUs, for all nine modes (see *Validation
   layers* below).
 * `lsl-gui --selftest` puts every installed game's launch options through
   apply-then-clear against the real `localconfig.vdf` and requires the round trip
@@ -707,7 +830,7 @@ revealed it.
 
 Core validation is installed for this user only, without root, and wired into
 CTest (`tools/setup-validation-layers.sh`, `tools/validation-check.sh`). It
-reports zero errors on both GPUs for all six modes, and on this increment it
+reports zero errors on both GPUs for all nine modes, and on this increment it
 earned its keep by catching bug 10 above.
 
 It also validates the layer's own commands, as long as it is loaded
@@ -805,7 +928,9 @@ and review — not on the layer.
    reciprocal moves a flat patch by up to one level. That is now documented
    rather than "fixed", because matching AMD is the point. Remaining work in this
    tier:
-   * **NIS** as an alternative `balanced` implementation to compare against.
+   * ~~**NIS** as an alternative `balanced` implementation to compare against.~~
+     — **done**, along with `lanczos3`, `cnn` and the `auto` policy; see
+     *Methods* above.
 5. ~~Work out how to enable synchronization validation~~ — **done**, and it
    changed the answer: the setting is `VK_LAYER_VALIDATE_SYNC=1`, and this VVL
    does not report compute/shader-storage hazards (issues 6061, 6096), so Phase
@@ -828,21 +953,30 @@ and review — not on the layer.
      `appmanifest_*.acf`, a per-game profile, the launch-options line written
      into `localconfig.vdf`, and a launch button. Still missing from this tier:
      packaging, so the layer can be installed without building it.
-   * **NIS** as an alternative `balanced` implementation, and a decision on
-     licensing (`third_party/ffx` is MIT; the layer itself has no third-party
-     code beyond the vendored FSR1 headers).
+   * ~~**More methods, and `auto`**~~ — **done**, see *Methods* above: `lanczos3`,
+     `nis` and Anime4K v4's Restore CNN (`cnn`), selected by `LSL_LAYER_MODE`,
+     with `auto` resolving from geometry. Licensing matches the existing
+     pattern: `third_party/ffx` and `third_party/anime4k` are both MIT and
+     vendored unmodified, and the layer has no other third-party code.
+   * **Packaging.** A distributable layer plus an installer, so a game can be
+     given the launch line without building the tree first.
 
 ## Layout
 
 ```
 layer/lsl_layer.c         the layer: the size lie, swapchain capture, present interception
-layer/lsl_upscale.c       the in-layer FSR1 EASU->RCAS present engine, plus PPM dumps
+layer/lsl_upscale.c       the in-layer present engine: every method, auto, PPM dumps
 layer/lsl_layer.h         shared layer/engine state, per-device function tables
+layer/lsl_method.{h,c}    the layer's C copy of the method vocabulary (src/method.hpp is C++)
 layer/VkLayer_lsl_frame.json  layer manifest, loaded per game
-shaders/scale.comp        GLSL compute scaler (nearest/bilinear/cubic/lanczos2/EASU)
+shaders/scale.comp        GLSL compute scaler (nearest/bilinear/cubic/lanczos2/lanczos3/EASU)
 shaders/rcas.comp         GLSL compute sharpener — FSR1's RCAS, a second dispatch
+shaders/nis.comp          GLSL compute sharpener — NIS's, written for the buffer model
+shaders/cnn.comp          GLSL compute — Anime4K v4's Restore CNN, four float passes
 shaders/                  compiled to SPIR-V at build time, embedded in the binary
 third_party/ffx/          AMD ffx_a.h + ffx_fsr1.h (MIT), vendored unmodified
+third_party/anime4k/      Anime4K v4 GLSL + MIT license text, vendored unmodified
+src/method.hpp            the C++ method table: ids, names, labels, `auto`
 src/lsl_vk.*              Vulkan scaffolding
 gui/main.cpp             lsl-gui: the GTK4 window (optional target)
 src/steam.{hpp,cpp}       Steam discovery, in-place VDF edit, launch-options merge
@@ -850,13 +984,16 @@ src/profile.{hpp,cpp}     the per-game profile store (plain text, atomic writes)
 tests/test_steam.cpp      the above, tested without a display
 src/reference.*           CPU filters, box downsampler, PSNR/SSIM, edge energy
 src/fsr1_ref.cpp          CPU FSR1 EASU + RCAS; compiles the vendored header via a shim
+src/nis_ref.*             CPU reference for the NIS sharpening pass
+src/cnn_ref.*             CPU reference for the Anime4K Restore CNN
 src/image_io.*            PPM/PGM I/O
 src/probe.cpp             lsl-probe
-src/upscale.cpp           lsl-upscale (fidelity + quality modes)
+src/upscale.cpp           lsl-upscale (fidelity + quality modes, `--list-modes`)
 tests/test_reference.cpp  CPU reference tests
 tools/embed_spv.py        SPIR-V -> C++ array
 tools/ffx_cpp_shim.py     GLSL 'inout'/'out' params -> C++ references
-tools/upscale-check.sh            layer gate: pixel match + validation + self-test
+tools/anime4k_weights.py  bake Anime4K's weights into a header the layer and CLI share
+tools/upscale-check.sh            layer gate: every method, pixel match + validation + self-test
 tools/ppm_tool.py                 PPM compare (bytes / max delta / PSNR) and swap
 tools/setup-validation-layers.sh   per-user validation layer install (no root)
 tools/with-validation.sh          run a command with validation forced on

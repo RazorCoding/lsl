@@ -89,6 +89,14 @@ float lanczos2Weight(float x)
     return sinc(x * 0.5) * sinc(x);
 }
 
+// Lanczos-3 kernel: L(x) = sinc(x) * sinc(x/3), zero beyond |x| >= 3.
+float lanczos3Weight(float x)
+{
+    x = abs(x);
+    if (x >= 3.0) return 0.0;
+    return sinc(x * (1.0 / 3.0)) * sinc(x);
+}
+
 // Mitchell-Netravali cubic. B = 0, C = 0.5 is exactly Catmull-Rom:
 //   |x|<1 : 1.5|x|^3 - 2.5|x|^2 + 1
 //   |x|<2 : -0.5|x|^3 + 2.5|x|^2 - 4|x| + 2
@@ -260,6 +268,26 @@ vec3 scaleLanczos2(int bx, int by, float fx, float fy)
     return (abs(wsum) > 1.0e-6) ? acc / wsum : acc;
 }
 
+// The same windowed sinc with the lobe widened from two texels to three. It
+// rings a little more than Lanczos-2 but holds more detail; it is the widest
+// of the pure separable filters here.
+vec3 scaleLanczos3(int bx, int by, float fx, float fy)
+{
+    vec3  acc  = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = -2; j <= 3; ++j)
+    {
+        float wy = lanczos3Weight(fy - float(j));
+        for (int k = -2; k <= 3; ++k)
+        {
+            float w = wy * lanczos3Weight(fx - float(k));
+            acc  += fetch(bx + k, by + j) * w;
+            wsum += w;
+        }
+    }
+    return (abs(wsum) > 1.0e-6) ? acc / wsum : acc;
+}
+
 // --- entry -----------------------------------------------------------------
 
 void main()
@@ -278,6 +306,7 @@ void main()
     else if (p.mode == 1u) v = scaleBilinear(bx, by, fx, fy);
     else if (p.mode == 2u) v = scaleCubic(bx, by, fx, fy);
     else if (p.mode == 3u) v = scaleLanczos2(bx, by, fx, fy);
+    else if (p.mode == 6u) v = scaleLanczos3(bx, by, fx, fy);
     else
     {
         AU4 con0, con1, con2, con3;

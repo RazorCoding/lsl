@@ -8,6 +8,8 @@
 
 #include "steam.hpp"
 
+#include "method.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -710,7 +712,7 @@ std::string steamOptionsClear(const std::string& existing,
 
 std::string steamOptionsApply(const std::string& existing,
                               const std::string& layer_dir, double scale,
-                              double sharpness) {
+                              double sharpness, const std::string& method) {
     OptionScan sc = scanOptions(existing);
     removeListEntry(&sc.add_layers, layer_dir);
     sc.add_layers.insert(sc.add_layers.begin(), layer_dir);  // ours first
@@ -720,6 +722,10 @@ std::string steamOptionsApply(const std::string& existing,
     std::vector<std::string> out;
     out.push_back("LSL_LAYER_SCALE=" + formatNumber(scale));
     out.push_back("LSL_LAYER_SHARPNESS=" + formatNumber(sharpness));
+    // An unrecognised method writes no variable at all rather than a name the
+    // layer would only warn about: an unset LSL_LAYER_MODE is precisely the
+    // default the layer already keeps.
+    if (isModeName(method)) out.push_back("LSL_LAYER_MODE=" + method);
     out.push_back(formatVar("VK_ADD_LAYER_PATH", joinList(sc.add_layers)));
     out.push_back(formatVar("VK_INSTANCE_LAYERS", joinList(sc.layers)));
     if (!sc.have_command) {
@@ -733,7 +739,7 @@ std::string steamOptionsApply(const std::string& existing,
 }
 
 bool steamOptionsParse(const std::string& existing, double* scale,
-                       double* sharpness) {
+                       double* sharpness, std::string* method) {
     bool found = false;
     for (const std::string& tok : splitTokens(existing)) {
         std::string key, val;
@@ -744,6 +750,11 @@ bool steamOptionsParse(const std::string& existing, double* scale,
             found = true;
         } else if (key == "LSL_LAYER_SHARPNESS") {
             *sharpness = std::strtod(val.c_str(), nullptr);
+        } else if (key == "LSL_LAYER_MODE") {
+            // A typo in a hand-written string leaves the caller's value alone
+            // rather than showing up in the GUI as a method that does not
+            // exist.
+            if (method && isModeName(val)) *method = val;
         }
     }
     return found;

@@ -3,6 +3,7 @@
 // timestamps and quality metrics against a CPU reference, and optionally
 // writes the result and a CSV row.
 
+#include "anime4k_restore_s.h"
 #include "image_io.hpp"
 #include "lsl_vk.hpp"
 #include "reference.hpp"
@@ -47,13 +48,15 @@ struct Args {
         "  --make-test WxH      generate a synthetic test pattern\n"
         "  --out FILE.ppm       write the upscaled image\n"
         "  --dst WxH            destination size (required)\n"
-        "  --modes LIST         nearest,bilinear,cubic,lanczos2,fsr1,fsr1rcas\n"
-        "                       (default: all)\n"
+        "  --modes LIST         nearest,bilinear,cubic,lanczos2,lanczos3,fsr1,\n"
+        "                       fsr1rcas,nis,cnn (default: all; \"auto\" has no CPU\n"
+        "                       reference and is rejected)\n"
         "  --sharpness N        RCAS strength in stops for fsr1rcas: 0 is the\n"
         "                       strongest lobe AMD's RCAS applies (default 0)\n"
         "  --device N           physical device index (default: see lsl-probe)\n"
         "  --bench N            timed iterations per mode (default 200)\n"
         "  --csv FILE           append a CSV header (once) and rows\n"
+        "  --list-modes         print one method name per line and exit\n"
         "  --quiet              only print the CSV/stdout table\n"
         "  --hazard             TEST ONLY: omit the EASU->RCAS barrier, to\n"
         "                       check whether sync validation reports it.\n"
@@ -76,12 +79,11 @@ bool parseWH(const std::string& s, uint32_t& w, uint32_t& h) {
 }
 
 uint32_t parseMode(const std::string& n) {
-    if (n == "nearest")  return lsl::MODE_NEAREST;
-    if (n == "bilinear") return lsl::MODE_BILINEAR;
-    if (n == "cubic")    return lsl::MODE_CUBIC;
-    if (n == "lanczos2") return lsl::MODE_LANCZOS2;
-    if (n == "fsr1")     return lsl::MODE_FSR1;
-    if (n == "fsr1rcas") return lsl::MODE_FSR1RCAS;
+    const int m = lsl::methodIdFromName(n.c_str());
+    if (m >= 0) return uint32_t(m);
+    if (lsl::isAutoMethod(n.c_str()))
+        usage("auto is chosen by the layer at run time and has no CPU "
+              "reference, so the benchmark cannot run it");
     usage(("unknown mode: " + n).c_str());
 }
 
@@ -111,6 +113,16 @@ Args parse(int argc, char** argv) {
         else if (k == "--sharpness")  a.sharpness = std::stof(need("--sharpness"));
         else if (k == "--quiet")      a.quiet = true;
         else if (k == "--hazard")     a.hazard = true;
+        else if (k == "--list-modes") {
+            // Every name method.hpp's table holds, one per line, and nothing
+            // else.  tools/upscale-check.sh iterates this to drive each method
+            // through the layer; printing it from the table rather than
+            // hardcoding a list in the script is what makes a newly added
+            // method fail the gate until the layer implements it too.
+            for (uint32_t m = 0; m < lsl::MODE_COUNT; ++m)
+                std::printf("%s\n", lsl::modeName(m));
+            std::exit(0);
+        }
         else if (k == "--dst") {
             if (!parseWH(need("--dst"), a.dstW, a.dstH)) usage("--dst wants WxH");
         } else if (k == "--make-test") {
@@ -285,10 +297,27 @@ int main(int argc, char** argv) {
         ctx->createBufferEx(srcBytes, kStore, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     lsl::Context::Buffer dstBuf =
         ctx->createBufferEx(dstBytes, kStore, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    // Holds the unsharpened EASU result between the two dispatches of the RCAS
-    // chain. Only that one mode uses it.
+    // Holds the unsharpened EASU result between the two dispatches of the
+    // chains that refine it (FSR1+RCAS, NIS, and the CNN's input).
     lsl::Context::Buffer scratchBuf =
         ctx->createBufferEx(dstBytes, kStore, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    // The CNN's scratch activations: one output-resolution RGBA float plane
+    // each, 16 bytes per pixel, ping-ponged by the four layers. It is the
+    // largest allocation in the CLI and the reason `cnn` is the slow method.
+    const VkDeviceSize cnnScratchBytes = VkDeviceSize(dstW) * dstH * 16;
+    lsl::Context::Buffer cnnA =
+        ctx->createBufferEx(cnnScratchBytes, kStore, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    lsl::Context::Buffer cnnB =
+        ctx->createBufferEx(cnnScratchBytes, kStore, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    const VkDeviceSize cnnWBytes = VkDeviceSize(sizeof(lsl_anime4k_weights));
+    lsl::Context::Buffer cnnWStage =
+        ctx->createBufferEx(cnnWBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                            lsl_anime4k_weights);
+    lsl::Context::Buffer cnnW =
+        ctx->createBufferEx(cnnWBytes, kStore, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!ctx->info().deviceLocalBytes) {
         // No DEVICE_LOCAL heap (should not happen on a real GPU): fall back so
         // the tool still runs instead of throwing from findMemoryType.
@@ -305,16 +334,40 @@ int main(int argc, char** argv) {
     VkPipelineLayout layout = ctx->createLayout(pcr, setLayout);
     VkPipeline scalePipe = ctx->createCompute(layout, scaleShader);
     VkPipeline rcasPipe  = ctx->createCompute(layout, rcasShader);
+    VkShaderModule nisShader = ctx->createShader(lsl_spv_nis_comp, lsl_spv_nis_comp_words);
+    VkShaderModule cnnShader = ctx->createShader(lsl_spv_cnn_comp, lsl_spv_cnn_comp_words);
+    VkPipeline nisPipe = ctx->createCompute(layout, nisShader);
+
+    // The CNN pass has its own push block (five words) and its own five-buffer
+    // descriptor layout, so it needs a second pipeline layout.
+    struct CnnPush {
+        uint32_t W, H, woff, boff, flags;
+    };
+    static_assert(sizeof(CnnPush) == 20, "CNN push constant block changed size");
+    VkPushConstantRange cnnRange{};
+    cnnRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    cnnRange.offset = 0;
+    cnnRange.size = sizeof(CnnPush);
+    VkDescriptorSetLayout cnnSetLayout = ctx->createSetLayoutN(5);
+    VkPipelineLayout cnnLayout = ctx->createLayout(cnnRange, cnnSetLayout);
+    VkPipeline cnnPipe = ctx->createCompute(cnnLayout, cnnShader);
+
     VkDescriptorPool pool = ctx->createPool();
     VkCommandPool cmdPool = ctx->createCmdPool();
     VkQueryPool queries = ctx->createQueries(2);
 
-    // One descriptor set per pass: every mode except fsr1rcas scales straight
-    // into the output; the RCAS chain reads the source through one set and the
-    // EASU result through another.
+    // One descriptor set per pass: every mode except the chains scales straight
+    // into the output; FSR1 and NIS read the source through one set and their
+    // scratch result through another; the CNN reads the EASU result, two
+    // scratch buffers, the weight table and the output.
     VkDescriptorSet setDirect = ctx->allocSet(pool, setLayout, srcBuf, dstBuf);
     VkDescriptorSet setScale  = ctx->allocSet(pool, setLayout, srcBuf, scratchBuf);
-    VkDescriptorSet setRcas   = ctx->allocSet(pool, setLayout, scratchBuf, dstBuf);
+    VkDescriptorSet setRefine = ctx->allocSet(pool, setLayout, scratchBuf, dstBuf);
+
+    // All four CNN layers share one set: same base, scratch, weights and
+    // output; only the push constant changes.
+    const lsl::Context::Buffer cnnBufs[5] = {scratchBuf, cnnA, cnnB, cnnW, dstBuf};
+    VkDescriptorSet setCnn = ctx->allocSetN(pool, cnnSetLayout, cnnBufs, 5);
 
     VkCommandBuffer cmd = ctx->allocCmd(cmdPool);
 
@@ -326,6 +379,8 @@ int main(int argc, char** argv) {
         vkBeginCommandBuffer(cmd, &bi);
         VkBufferCopy region{0, 0, srcBytes};
         vkCmdCopyBuffer(cmd, srcStage.buf, srcBuf.buf, 1, &region);
+        VkBufferCopy wregion{0, 0, cnnWBytes};
+        vkCmdCopyBuffer(cmd, cnnWStage.buf, cnnW.buf, 1, &wregion);
         VkMemoryBarrier2 mb{};
         mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         mb.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -351,41 +406,78 @@ int main(int argc, char** argv) {
         vkCmdResetQueryPool(cmd, queries, 0, 2);
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, queries, 0);
 
-        // fsr1rcas is the only mode that is not one dispatch: EASU lands in the
-        // scratch buffer, then RCAS sharpens it into the output. Both dispatches
-        // sit inside the same timestamp pair, so the reported time is the whole
-        // chain - which is what a real FSR1 upscale costs.
+        // fsr1rcas, nis and cnn are the modes that are not one dispatch. EASU
+        // lands in the scratch buffer and a second pass refines it into the
+        // output -- RCAS for fsr1rcas, NIS's sharpening for nis, and four
+        // convolutions for cnn. Every dispatch in the chain sits inside the
+        // same timestamp pair, so the reported time is what the whole method
+        // costs -- which is what a real present-time upscale pays.
         const bool rcasChain = (mode == lsl::MODE_FSR1RCAS);
+        const bool nisChain  = (mode == lsl::MODE_NIS);
+        const bool cnnChain  = (mode == lsl::MODE_CNN);
+        const bool refine    = rcasChain || nisChain || cnnChain;
         const uint32_t groupsX = (dstW + 15) / 16, groupsY = (dstH + 15) / 16;
 
+        // Any pass that reads what a previous pass just wrote needs this
+        // barrier between them.
+        auto gpuBarrier = [&] {
+            VkMemoryBarrier2 b{};
+            b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            b.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            b.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+            b.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            b.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+            VkDependencyInfo d{};
+            d.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            d.memoryBarrierCount = 1;
+            d.pMemoryBarriers = &b;
+            if (!a.hazard) vkCmdPipelineBarrier2(cmd, &d);
+        };
+
         lsl::Push p1{src.w, src.h, dstW, dstH,
-                     rcasChain ? uint32_t(lsl::MODE_FSR1) : mode, 0.0f, 0, 0};
+                     refine ? uint32_t(lsl::MODE_FSR1) : mode, 0.0f, 0, 0};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, scalePipe);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
-                                rcasChain ? &setScale : &setDirect, 0, nullptr);
+                                refine ? &setScale : &setDirect, 0, nullptr);
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p1), &p1);
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
-        if (rcasChain) {
-            // RCAS reads what the EASU dispatch just wrote.
-            VkMemoryBarrier2 eb{};
-            eb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            eb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            eb.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-            eb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            eb.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-            VkDependencyInfo ed{};
-            ed.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            ed.memoryBarrierCount = 1;
-            ed.pMemoryBarriers = &eb;
-            if (!a.hazard) vkCmdPipelineBarrier2(cmd, &ed);
+        if (refine) {
+            // Everything below reads what the EASU dispatch just wrote.
+            gpuBarrier();
+        }
 
+        if (rcasChain || nisChain) {
             lsl::Push p2{dstW, dstH, dstW, dstH, 0u, a.sharpness, 0u, 0u};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rcasPipe);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              rcasChain ? rcasPipe : nisPipe);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1,
-                                    &setRcas, 0, nullptr);
+                                    &setRefine, 0, nullptr);
             vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p2), &p2);
             vkCmdDispatch(cmd, groupsX, groupsY, 1);
+        } else if (cnnChain) {
+            // Four layers over two ping-ponged scratch planes; the plan below
+            // is the one the CPU reference and the layer both use.
+            const uint32_t cnnGroupsX = (dstW + 7) / 8, cnnGroupsY = (dstH + 7) / 8;
+            for (uint32_t L = 0; L < uint32_t(LSL_ANIME4K_LAYERS); ++L) {
+                if (L) gpuBarrier();
+                uint32_t flags = 0;
+                if (lsl_anime4k_layers[L].split)    flags |= LSL_CNN_SPLIT;
+                if (lsl_anime4k_layers[L].add_base) flags |= LSL_CNN_ADD_BASE;
+                if (L == 0) flags |= LSL_CNN_READ_BASE;
+                if (L == 1) flags |= LSL_CNN_DST_B;
+                if (L == 2) flags |= LSL_CNN_SRC_B;
+                if (L == LSL_ANIME4K_LAYERS - 1) flags |= LSL_CNN_WRITE_IMAGE;
+                const CnnPush cp{dstW, dstH,
+                                 uint32_t(lsl_anime4k_layers[L].woff),
+                                 uint32_t(lsl_anime4k_layers[L].boff), flags};
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cnnPipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cnnLayout, 0,
+                                        1, &setCnn, 0, nullptr);
+                vkCmdPushConstants(cmd, cnnLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                   sizeof(cp), &cp);
+                vkCmdDispatch(cmd, cnnGroupsX, cnnGroupsY, 1);
+            }
         }
 
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, queries, 1);
@@ -506,13 +598,23 @@ int main(int argc, char** argv) {
     vkDestroyDescriptorPool(ctx->device(), pool, nullptr);
     vkDestroyPipeline(ctx->device(), scalePipe, nullptr);
     vkDestroyPipeline(ctx->device(), rcasPipe, nullptr);
+    vkDestroyPipeline(ctx->device(), nisPipe, nullptr);
+    vkDestroyPipeline(ctx->device(), cnnPipe, nullptr);
     vkDestroyPipelineLayout(ctx->device(), layout, nullptr);
+    vkDestroyPipelineLayout(ctx->device(), cnnLayout, nullptr);
     vkDestroyDescriptorSetLayout(ctx->device(), setLayout, nullptr);
+    vkDestroyDescriptorSetLayout(ctx->device(), cnnSetLayout, nullptr);
     vkDestroyShaderModule(ctx->device(), scaleShader, nullptr);
     vkDestroyShaderModule(ctx->device(), rcasShader, nullptr);
+    vkDestroyShaderModule(ctx->device(), nisShader, nullptr);
+    vkDestroyShaderModule(ctx->device(), cnnShader, nullptr);
     ctx->destroyBuffer(srcBuf);
     ctx->destroyBuffer(dstBuf);
     ctx->destroyBuffer(scratchBuf);
+    ctx->destroyBuffer(cnnA);
+    ctx->destroyBuffer(cnnB);
+    ctx->destroyBuffer(cnnW);
+    ctx->destroyBuffer(cnnWStage);
     ctx->destroyBuffer(srcStage);
     ctx->destroyBuffer(dstStage);
 

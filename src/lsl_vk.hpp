@@ -71,10 +71,15 @@ class Context {
     VkPipelineLayout      createLayout(VkPushConstantRange pcr,
                                        VkDescriptorSetLayout setLayout) const;
     VkDescriptorSetLayout createSetLayout() const;
+    // N storage-buffer bindings. Most passes need two (source, destination);
+    // the Anime4K CNN needs five (base, scratch A, scratch B, weights, out).
+    VkDescriptorSetLayout createSetLayoutN(uint32_t bindings) const;
     VkPipeline            createCompute(VkPipelineLayout layout, VkShaderModule sh) const;
     VkDescriptorPool      createPool() const;
     VkDescriptorSet       allocSet(VkDescriptorPool pool, VkDescriptorSetLayout lay,
                                    Buffer src, Buffer dst) const;
+    VkDescriptorSet       allocSetN(VkDescriptorPool pool, VkDescriptorSetLayout lay,
+                                    const Buffer* buffers, uint32_t count) const;
     VkCommandPool         createCmdPool() const;
     VkCommandBuffer       allocCmd(VkCommandPool pool) const;
     VkQueryPool           createQueries(uint32_t count) const;

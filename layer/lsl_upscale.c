@@ -1,19 +1,33 @@
 /*
- * lsl_upscale.c -- the layer's FSR1 upscaling engine.
+ * lsl_upscale.c -- the layer's present-time upscaling engine.
  *
  * What this does, at present time, on the application's own queue:
  *
  *   swapchain image (N x M, but only the top-left W x H holds the app's frame)
  *     -> copy to buf_in
- *     -> EASU  (shaders/scale.comp, mode 4)          W x H -> N x M
- *     -> RCAS  (shaders/rcas.comp)                   N x M -> N x M
+ *     -> scale   (shaders/scale.comp)                W x H -> N x M
+ *     -> [refiner]                                    N x M -> N x M
  *     -> copy back over the whole swapchain image
+ *
+ * `scale` is where the method lives.  A spatial method (nearest, bilinear,
+ * cubic, lanczos2, lanczos3) is the whole upscale, so it runs `scale` with that
+ * method's id and nothing else.  FSR1 is EASU, so `fsr1` is `scale` with mode 4;
+ * the methods that refine the EASU result pick it with mode 4 and then run a
+ * second pass at destination resolution:
+ *
+ *   fsr1rcas   scale(EASU) -> rcas            (shaders/rcas.comp)
+ *   nis        scale(EASU) -> nis             (shaders/nis.comp)
+ *   cnn        scale(EASU) -> 4 conv layers   (shaders/cnn.comp)
+ *
+ * The refiner is what makes the pass count per method visible: the barrier plan
+ * below is written once for each of the three.
  *
  * Buffers rather than sampled images, because the Phase 1 shaders -- and the CPU
  * reference they are checked against -- work on tightly packed storage buffers.
  * Reusing the exact same shaders means the layer's output can be compared pixel
  * for pixel against `lsl-upscale` fed the same input, which is how this gets
- * verified without looking at the screen (see tools/upscale-check.sh).
+ * verified without looking at the screen (see tools/upscale-check.sh).  That
+ * comparison is run for every method, not just the default.
  *
  * Two pixel layouts, chosen from the swapchain format:
  *
@@ -31,6 +45,8 @@
  */
 
 #include "lsl_layer.h"
+#include "lsl_method.h"
+#include "anime4k_restore_s.h"
 #include "spv_blob_c.h"
 
 #include <stdint.h>
@@ -76,21 +92,32 @@ static const char *format_name(VkFormat f) {
 
 /* --------------------------------------------------------------- engine state */
 
-/* Must match the push_constant block in shaders/scale.comp and shaders/rcas.comp. */
+/* Must match the push_constant block in shaders/scale.comp, shaders/rcas.comp and
+ * shaders/nis.comp. */
 typedef struct {
     uint32_t srcW, srcH, dstW, dstH;
-    uint32_t mode;      /* 4 = FSR1 EASU; ignored by rcas.comp */
+    uint32_t mode;      /* an LSL_MODE_* value for scale.comp; ignored by the refiners */
     float sharpness;
     uint32_t pad0, pad1;
 } PushConst;
+
+/* shaders/cnn.comp has its own five-word push block, because it is dispatched
+ * once per layer and each layer is described by its weight offsets and flags. */
+typedef struct {
+    uint32_t W, H;
+    uint32_t woff, boff;   /* this layer's first matrix and bias, as float indices */
+    uint32_t flags;        /* LSL_CNN_* */
+} CnnPushConst;
 
 /* Two in flight.  A slot's buffers and command buffer may not be touched again
  * until its fence signals, and the fence for an older slot is normally already
  * signalled, so reuse does not cost a stall. */
 #define UP_SLOTS 2
 
-/* shaders/scale.comp and shaders/rcas.comp both use 16x16 workgroups. */
+/* shaders/scale.comp, shaders/rcas.comp and shaders/nis.comp all use 16x16
+ * workgroups; shaders/cnn.comp uses 8x8. */
 #define UP_GROUPS(n) (((n) + 15u) / 16u)
+#define UP_GROUPS_CNN(n) (((n) + 7u) / 8u)
 
 typedef struct {
     VkCommandBuffer cmd;
@@ -98,8 +125,14 @@ typedef struct {
     int submitted;
     VkBuffer in, mid;          /* plane_bytes each */
     VkDeviceMemory in_mem, mid_mem;
-    VkDescriptorSet set_easu;  /* in  -> mid */
-    VkDescriptorSet set_rcas;  /* mid -> in  */
+    VkDescriptorSet set_scale;   /* in  -> mid : every method's first pass */
+    VkDescriptorSet set_refine;  /* mid -> in  : rcas / nis */
+    /* The CNN ping-pongs two float activations.  Only allocated -- like
+     * set_cnn -- when the method needs them, so the default costs no more
+     * memory than it did before the methods existed. */
+    VkBuffer cnn_a, cnn_b;
+    VkDeviceMemory cnn_a_mem, cnn_b_mem;
+    VkDescriptorSet set_cnn;   /* mid, cnn_a, cnn_b, weights, in */
 } UpSlot;
 
 typedef struct {
@@ -115,14 +148,28 @@ typedef struct {
      * validation layer aborts on it. */
     LslDevFns fn;
     LslUpscaleShape shape;
+    uint32_t mode;        /* shape.mode, resolved: never LSL_MODE_AUTO here */
+    int declared_auto;    /* shape.mode was LSL_MODE_AUTO, for the log line */
     uint32_t family;
     uint32_t texel;
     int is16;
     VkDeviceSize plane_bytes;
 
-    VkDescriptorSetLayout dsl;
+    VkDescriptorSetLayout dsl;      /* two storage buffers */
     VkPipelineLayout playout;
-    VkPipeline pipe_easu, pipe_rcas;
+    VkPipeline pipe_scale;
+    VkPipeline pipe_rcas;
+    VkPipeline pipe_nis;
+    /* shaders/cnn.comp samples five buffers (base, A, B, weights, out), so it
+     * needs its own set layout and pipeline layout. */
+    VkDescriptorSetLayout dsl_cnn;
+    VkPipelineLayout playout_cnn;
+    VkPipeline pipe_cnn;
+    /* The 4 KB weight table, host visible: it is read-only and tiny enough to
+     * stay in the GPU's cache, and keeping it in host memory avoids needing a
+     * queue to stage it at build time. */
+    VkBuffer wts;
+    VkDeviceMemory wts_mem;
     VkDescriptorPool dpool;
 
     UpSlot slot[UP_SLOTS];
@@ -168,6 +215,71 @@ static int up_have_fns(void) {
            g_up.fn.create_compute_pipelines && g_up.fn.destroy_pipeline &&
            g_up.fn.create_descriptor_pool && g_up.fn.destroy_descriptor_pool &&
            g_up.fn.allocate_descriptor_sets && g_up.fn.update_descriptor_sets;
+}
+
+/* --------------------------------------------------------------- the methods */
+
+/* The methods that upscale with EASU and then refine at destination resolution.
+ * They all run scale.comp with mode 4 first. */
+static int mode_is_refined(uint32_t m) {
+    return m == LSL_MODE_FSR1RCAS || m == LSL_MODE_NIS || m == LSL_MODE_CNN;
+}
+
+/* LSL_LAYER_MODE=auto.  The layer is asked to choose from geometry alone --
+ * the frame it would have to inspect has already been copied by the time it
+ * gets there -- and it makes the choice once per swapchain, because a
+ * per-frame one would flicker as the picture changed.
+ *
+ * There is no free lunch to hand out, so the rule follows the measurements
+ * (1600x1000 -> 2560x1600; dispatch cost per frame, and PSNR / edge energy
+ * against the original in `--render` quality mode, where the ground truth's
+ * edge energy is 3.69):
+ *
+ *   method     cost      PSNR      edge
+ *   fsr1rcas   1.97 ms   35.36 dB  4.23   the historical default; RCAS at
+ *                                         strength 0 overshoots the edge
+ *                                         energy of the original
+ *   nis        2.87 ms   36.05 dB  3.01   costs 1.5x, scores a bit better,
+ *                                         sharpens much more gently
+ *   lanczos3   3.39 ms   36.85 dB  1.94   best PSNR, no sharpening at all
+ *   cnn       20.03 ms   36.15 dB  2.33   four float convolutions, ~5 ns a
+ *                                         destination pixel
+ *
+ * Hence cnn is the one that has to be rationed, and by output size rather than
+ * ratio: it is the only method that reconstructs rather than resamples, and
+ * 1280x720 -- about 1 Mpx, roughly 5 ms -- is where it stops fitting a frame
+ * (an application rendering 640x360 for a 720p window can afford it).  Above
+ * that, a big ratio means the application really did throw detail away, and
+ * the milder sharpening is a better match than RCAS's maximum lobe: that is
+ * what nis is for.  Everything else stays on the historical default.
+ */
+#define LSL_AUTO_CNN_MAX_PIXELS (1280u * 720u)
+
+static uint32_t lsl_auto_pick(uint32_t app_w, uint32_t app_h,
+                              uint32_t real_w, uint32_t real_h) {
+    if (!app_w || !app_h) return LSL_MODE_FSR1RCAS;
+    if ((uint64_t)real_w * real_h <= LSL_AUTO_CNN_MAX_PIXELS) return LSL_MODE_CNN;
+    const float rx = (float)real_w / (float)app_w;
+    const float ry = (float)real_h / (float)app_h;
+    const float ratio = rx > ry ? rx : ry;
+    if (ratio >= 1.5f) return LSL_MODE_NIS;
+    return LSL_MODE_FSR1RCAS;
+}
+
+/* shaders/cnn.comp hardcodes the 3x3 tap order; the generated weight table
+ * records the order the generator validated it against.  If they disagreed the
+ * GPU and the CPU reference would multiply the same weight by different
+ * neighbours.  tools/anime4k_weights.py already refuses any other order, so
+ * this is the cheap check that also keeps the table referenced. */
+static int anime4k_layout_ok(void) {
+    static const int want[9][2] = {{-1, -1}, {-1, 0}, {-1, 1},
+                                   {0, -1},  {0, 0},  {0, 1},
+                                   {1, -1},  {1, 0},  {1, 1}};
+    for (int i = 0; i < 9; ++i)
+        if (lsl_anime4k_offsets[i][0] != want[i][0] ||
+            lsl_anime4k_offsets[i][1] != want[i][1])
+            return 0;
+    return 1;
 }
 
 static uint32_t pick_queue_family(VkPhysicalDevice pd, VkSurfaceKHR surface) {
@@ -291,14 +403,17 @@ static VkPipeline make_pipeline(const uint32_t *code, size_t words,
 }
 
 static void write_sets(void) {
+    const int with_cnn = (g_up.mode == LSL_MODE_CNN);
+    const uint32_t n_bind = with_cnn ? 5u : 2u;
+
     for (int i = 0; i < UP_SLOTS; ++i) {
         UpSlot *s = &g_up.slot[i];
-        VkDescriptorBufferInfo bi[2];
-        VkWriteDescriptorSet w[2];
+        VkDescriptorBufferInfo bi[5];
+        VkWriteDescriptorSet w[5];
         memset(w, 0, sizeof(w));
-        for (int k = 0; k < 2; ++k) {
+        for (uint32_t k = 0; k < n_bind; ++k) {
             w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[k].dstBinding = (uint32_t)k;
+            w[k].dstBinding = k;
             w[k].descriptorCount = 1;
             w[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w[k].pBufferInfo = &bi[k];
@@ -308,15 +423,27 @@ static void write_sets(void) {
 
         bi[0].buffer = s->in;
         bi[1].buffer = s->mid;
-        w[0].dstSet = s->set_easu;
-        w[1].dstSet = s->set_easu;
+        w[0].dstSet = s->set_scale;
+        w[1].dstSet = s->set_scale;
         g_up.fn.update_descriptor_sets(up_dev(), 2, w, 0, NULL);
 
         bi[0].buffer = s->mid;
         bi[1].buffer = s->in;
-        w[0].dstSet = s->set_rcas;
-        w[1].dstSet = s->set_rcas;
+        w[0].dstSet = s->set_refine;
+        w[1].dstSet = s->set_refine;
         g_up.fn.update_descriptor_sets(up_dev(), 2, w, 0, NULL);
+
+        if (with_cnn) {
+            /* mid, the two activations, the shared weight table, and the
+             * output buffer shaders/cnn.comp's writeImage lands in. */
+            bi[0].buffer = s->mid;
+            bi[1].buffer = s->cnn_a;
+            bi[2].buffer = s->cnn_b;
+            bi[3].buffer = g_up.wts;
+            bi[4].buffer = s->in;
+            for (uint32_t k = 0; k < 5; ++k) w[k].dstSet = s->set_cnn;
+            g_up.fn.update_descriptor_sets(up_dev(), 5, w, 0, NULL);
+        }
     }
 }
 
@@ -339,19 +466,26 @@ static void up_wait_slots(void) {
     }
 }
 
-/* The only extent-sized objects: each slot's two planes and the staging buffer
- * the dump reads through.  Everything else -- pipelines, descriptor sets, the
- * command pool -- is extent-independent, which is what makes a resize cheap.
- * The caller calls write_sets() once the descriptor sets exist. */
+/* The only extent-sized objects: each slot's planes, the CNN activations when
+ * the method uses them, and the staging buffer the dump reads through.
+ * Everything else -- pipelines, descriptor sets, the command pool -- is
+ * extent-independent, which is what makes a resize cheap.  The caller calls
+ * write_sets() once the descriptor sets exist. */
 static void up_free_planes(void) {
     for (int i = 0; i < UP_SLOTS; ++i) {
         UpSlot *s = &g_up.slot[i];
         free_buffer(s->in, s->in_mem);
         free_buffer(s->mid, s->mid_mem);
+        free_buffer(s->cnn_a, s->cnn_a_mem);
+        free_buffer(s->cnn_b, s->cnn_b_mem);
         s->in = VK_NULL_HANDLE;
         s->in_mem = VK_NULL_HANDLE;
         s->mid = VK_NULL_HANDLE;
         s->mid_mem = VK_NULL_HANDLE;
+        s->cnn_a = VK_NULL_HANDLE;
+        s->cnn_a_mem = VK_NULL_HANDLE;
+        s->cnn_b = VK_NULL_HANDLE;
+        s->cnn_b_mem = VK_NULL_HANDLE;
     }
     free_buffer(g_up.stage, g_up.stage_mem);
     g_up.stage = VK_NULL_HANDLE;
@@ -359,11 +493,17 @@ static void up_free_planes(void) {
 }
 
 static int up_make_planes(void) {
+    const int with_cnn = (g_up.mode == LSL_MODE_CNN);
+    /* The CNN's activations are floats -- two RGBA planes, 16 bytes a pixel --
+     * whatever the packed end of the chain is. */
+    const VkDeviceSize cnn_bytes =
+        (VkDeviceSize)g_up.shape.real_w * g_up.shape.real_h * 16u;
+
     for (int i = 0; i < UP_SLOTS; ++i) {
         UpSlot *s = &g_up.slot[i];
         /* `in` is copied into (TRANSFER_DST), copied out of for the dump and the
          * copy back (TRANSFER_SRC), and read and written by the shaders.  `mid`
-         * is only ever touched by the shaders. */
+         * is written by the first pass and read by the refiner and the dump. */
         if (!make_buffer(g_up.plane_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -373,6 +513,16 @@ static int up_make_planes(void) {
                                                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &s->mid, &s->mid_mem))
             return 0;
+        if (with_cnn) {
+            if (!make_buffer(cnn_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             &s->cnn_a, &s->cnn_a_mem))
+                return 0;
+            if (!make_buffer(cnn_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                             &s->cnn_b, &s->cnn_b_mem))
+                return 0;
+        }
     }
     if (!make_buffer(g_up.stage_easu_off + g_up.plane_bytes,
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -413,6 +563,7 @@ void lsl_upscale_end(void) {
     }
     up_wait_slots();
     up_free_planes();
+    free_buffer(g_up.wts, g_up.wts_mem);
     for (int i = 0; i < UP_SLOTS; ++i) {
         UpSlot *s = &g_up.slot[i];
         if (s->fence && g_up.fn.destroy_fence) g_up.fn.destroy_fence(dev, s->fence, NULL);
@@ -421,20 +572,29 @@ void lsl_upscale_end(void) {
         g_up.fn.destroy_descriptor_pool(dev, g_up.dpool, NULL);
     if (g_up.pool && g_up.fn.destroy_command_pool)
         g_up.fn.destroy_command_pool(dev, g_up.pool, NULL);
-    if (g_up.pipe_easu && g_up.fn.destroy_pipeline)
-        g_up.fn.destroy_pipeline(dev, g_up.pipe_easu, NULL);
+    if (g_up.pipe_scale && g_up.fn.destroy_pipeline)
+        g_up.fn.destroy_pipeline(dev, g_up.pipe_scale, NULL);
     if (g_up.pipe_rcas && g_up.fn.destroy_pipeline)
         g_up.fn.destroy_pipeline(dev, g_up.pipe_rcas, NULL);
+    if (g_up.pipe_nis && g_up.fn.destroy_pipeline)
+        g_up.fn.destroy_pipeline(dev, g_up.pipe_nis, NULL);
+    if (g_up.pipe_cnn && g_up.fn.destroy_pipeline)
+        g_up.fn.destroy_pipeline(dev, g_up.pipe_cnn, NULL);
     if (g_up.playout && g_up.fn.destroy_pipeline_layout)
         g_up.fn.destroy_pipeline_layout(dev, g_up.playout, NULL);
+    if (g_up.playout_cnn && g_up.fn.destroy_pipeline_layout)
+        g_up.fn.destroy_pipeline_layout(dev, g_up.playout_cnn, NULL);
     if (g_up.dsl && g_up.fn.destroy_descriptor_set_layout)
         g_up.fn.destroy_descriptor_set_layout(dev, g_up.dsl, NULL);
+    if (g_up.dsl_cnn && g_up.fn.destroy_descriptor_set_layout)
+        g_up.fn.destroy_descriptor_set_layout(dev, g_up.dsl_cnn, NULL);
     memset(&g_up, 0, sizeof(g_up));
 }
 
 static int same_shape(const LslUpscaleShape *a, const LslUpscaleShape *b) {
     return a->format == b->format && a->real_w == b->real_w &&
-           a->real_h == b->real_h && a->app_w == b->app_w && a->app_h == b->app_h;
+           a->real_h == b->real_h && a->app_w == b->app_w &&
+           a->app_h == b->app_h && a->mode == b->mode;
 }
 
 /* The engine's command pool and its barriers are tied to one queue family, so a
@@ -460,6 +620,15 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
                 (int)shape->format, format_name(shape->format));
         return 0;
     }
+
+    /* Resolve "auto" here rather than per frame, so the choice is a property of
+     * the swapchain.  See lsl_auto_pick(). */
+    const int declared_auto = (shape->mode == LSL_MODE_AUTO);
+    const uint32_t mode = declared_auto
+        ? lsl_auto_pick(shape->app_w, shape->app_h, shape->real_w, shape->real_h)
+        : shape->mode;
+    /* The shape carries the declared mode, so an auto engine compares equal to
+     * itself on the next frame of the same swapchain. */
     if (g_up.valid && g_up.dev == dev && same_shape(&g_up.shape, shape)) return 1;
 
     /* Same device, same pixel format, and the same present queue family: a
@@ -469,7 +638,7 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
      * instead of a whole pipeline build -- and, more importantly, the rebuild
      * waits for the frames still in flight on the queue before it frees
      * anything, which a resize does not otherwise make the application do. */
-    if (g_up.valid && g_up.dev == dev &&
+    if (g_up.valid && g_up.dev == dev && g_up.mode == mode &&
         g_up.is16 == (lsl_format_is_16f(shape->format) != 0) &&
         g_up.texel == lsl_format_texel_bytes(shape->format) &&
         surface_family_matches(dev, surface)) {
@@ -509,6 +678,8 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
 
     g_up.shape = *shape;
     g_up.dev = dev;
+    g_up.mode = mode;
+    g_up.declared_auto = declared_auto;
     g_up.is16 = lsl_format_is_16f(shape->format);
     g_up.texel = lsl_format_texel_bytes(shape->format);
     g_up.plane_bytes = (VkDeviceSize)shape->real_w * shape->real_h * g_up.texel;
@@ -536,10 +707,16 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
         }                                            \
     } while (0)
 
-    VkDescriptorSetLayoutBinding bind[2];
+    const int with_rcas = (mode == LSL_MODE_FSR1RCAS);
+    const int with_nis  = (mode == LSL_MODE_NIS);
+    const int with_cnn  = (mode == LSL_MODE_CNN);
+
+    /* scale.comp, rcas.comp and nis.comp all take (src, dst); the CNN takes
+     * five buffers and gets its own layout below. */
+    VkDescriptorSetLayoutBinding bind[5];
     memset(bind, 0, sizeof(bind));
-    for (int k = 0; k < 2; ++k) {
-        bind[k].binding = (uint32_t)k;
+    for (uint32_t k = 0; k < 5; ++k) {
+        bind[k].binding = k;
         bind[k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bind[k].descriptorCount = 1;
         bind[k].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -557,6 +734,11 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.size = (uint32_t)sizeof(PushConst);
 
+    VkPushConstantRange pcr_cnn;
+    memset(&pcr_cnn, 0, sizeof(pcr_cnn));
+    pcr_cnn.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr_cnn.size = (uint32_t)sizeof(CnnPushConst);
+
     VkPipelineLayoutCreateInfo plci;
     memset(&plci, 0, sizeof(plci));
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -567,25 +749,76 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     UP_CHECK(g_up.fn.create_pipeline_layout(up_dev(), &plci, NULL, &g_up.playout),
              "create_pipeline_layout");
 
-    if (g_up.is16) {
-        g_up.pipe_easu = make_pipeline(lsl_spv_scale16_comp, lsl_spv_scale16_comp_words, g_up.playout);
-        g_up.pipe_rcas = make_pipeline(lsl_spv_rcas16_comp, lsl_spv_rcas16_comp_words, g_up.playout);
-    } else {
-        g_up.pipe_easu = make_pipeline(lsl_spv_scale_comp, lsl_spv_scale_comp_words, g_up.playout);
-        g_up.pipe_rcas = make_pipeline(lsl_spv_rcas_comp, lsl_spv_rcas_comp_words, g_up.playout);
+    /* scale.comp is every method's first pass, so it is always built.  The
+     * refiners are built only for the method that will run them, which keeps
+     * the default's cost exactly what it was before the methods existed. */
+    if (g_up.is16)
+        g_up.pipe_scale = make_pipeline(lsl_spv_scale16_comp, lsl_spv_scale16_comp_words, g_up.playout);
+    else
+        g_up.pipe_scale = make_pipeline(lsl_spv_scale_comp, lsl_spv_scale_comp_words, g_up.playout);
+    if (!g_up.pipe_scale) UP_FAIL("the scale compute pipeline");
+
+    if (with_rcas) {
+        if (g_up.is16)
+            g_up.pipe_rcas = make_pipeline(lsl_spv_rcas16_comp, lsl_spv_rcas16_comp_words, g_up.playout);
+        else
+            g_up.pipe_rcas = make_pipeline(lsl_spv_rcas_comp, lsl_spv_rcas_comp_words, g_up.playout);
+        if (!g_up.pipe_rcas) UP_FAIL("the RCAS compute pipeline");
     }
-    if (!g_up.pipe_easu) UP_FAIL("EASU compute pipeline");
-    if (!g_up.pipe_rcas) UP_FAIL("RCAS compute pipeline");
+
+    if (with_nis) {
+        if (g_up.is16)
+            g_up.pipe_nis = make_pipeline(lsl_spv_nis16_comp, lsl_spv_nis16_comp_words, g_up.playout);
+        else
+            g_up.pipe_nis = make_pipeline(lsl_spv_nis_comp, lsl_spv_nis_comp_words, g_up.playout);
+        if (!g_up.pipe_nis) UP_FAIL("the NIS compute pipeline");
+    }
+
+    if (with_cnn) {
+        if (!anime4k_layout_ok()) UP_FAIL("the Anime4K tap order");
+
+        dlci.bindingCount = 5;
+        UP_CHECK(g_up.fn.create_descriptor_set_layout(up_dev(), &dlci, NULL, &g_up.dsl_cnn),
+                 "create the CNN descriptor set layout");
+
+        plci.pSetLayouts = &g_up.dsl_cnn;
+        plci.pPushConstantRanges = &pcr_cnn;
+        UP_CHECK(g_up.fn.create_pipeline_layout(up_dev(), &plci, NULL, &g_up.playout_cnn),
+                 "create the CNN pipeline layout");
+
+        if (g_up.is16)
+            g_up.pipe_cnn = make_pipeline(lsl_spv_cnn16_comp, lsl_spv_cnn16_comp_words, g_up.playout_cnn);
+        else
+            g_up.pipe_cnn = make_pipeline(lsl_spv_cnn_comp, lsl_spv_cnn_comp_words, g_up.playout_cnn);
+        if (!g_up.pipe_cnn) UP_FAIL("the CNN compute pipeline");
+
+        /* The weight table is 4 KB, read-only and the same for every frame and
+         * every extent, so it lives in host memory rather than being staged to
+         * the device: it stays resident in the GPU's cache, and the engine does
+         * not need the queue this early to upload it. */
+        if (!make_buffer((VkDeviceSize)sizeof(lsl_anime4k_weights),
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                         &g_up.wts, &g_up.wts_mem))
+            UP_FAIL("the CNN weight buffer");
+        void *wmap = NULL;
+        UP_CHECK(g_up.fn.map_memory(up_dev(), g_up.wts_mem, 0,
+                                    (VkDeviceSize)sizeof(lsl_anime4k_weights), 0, &wmap),
+                 "mapping the CNN weights");
+        memcpy(wmap, lsl_anime4k_weights, sizeof(lsl_anime4k_weights));
+        g_up.fn.unmap_memory(up_dev(), g_up.wts_mem);
+    }
 
     VkDescriptorPoolSize dps;
     memset(&dps, 0, sizeof(dps));
     dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    /* Two sets per slot -- one EASU, one RCAS -- each with two storage buffers. */
-    dps.descriptorCount = 4 * UP_SLOTS;
+    /* Two sets per slot -- scale and refine -- plus the CNN set, which names
+     * five buffers rather than two, when the method uses it. */
+    dps.descriptorCount = (2u + 2u + (with_cnn ? 5u : 0u)) * UP_SLOTS;
     VkDescriptorPoolCreateInfo dpci;
     memset(&dpci, 0, sizeof(dpci));
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 2 * UP_SLOTS;
+    dpci.maxSets = (2u + (with_cnn ? 1u : 0u)) * UP_SLOTS;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &dps;
     UP_CHECK(g_up.fn.create_descriptor_pool(up_dev(), &dpci, NULL, &g_up.dpool),
@@ -601,10 +834,15 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
     dsai.pSetLayouts = layouts;
 
     VkDescriptorSet sets[UP_SLOTS];
-    UP_CHECK(g_up.fn.allocate_descriptor_sets(up_dev(), &dsai, sets), "allocate EASU sets");
-    for (int i = 0; i < UP_SLOTS; ++i) g_up.slot[i].set_easu = sets[i];
-    UP_CHECK(g_up.fn.allocate_descriptor_sets(up_dev(), &dsai, sets), "allocate RCAS sets");
-    for (int i = 0; i < UP_SLOTS; ++i) g_up.slot[i].set_rcas = sets[i];
+    UP_CHECK(g_up.fn.allocate_descriptor_sets(up_dev(), &dsai, sets), "allocate scale sets");
+    for (int i = 0; i < UP_SLOTS; ++i) g_up.slot[i].set_scale = sets[i];
+    UP_CHECK(g_up.fn.allocate_descriptor_sets(up_dev(), &dsai, sets), "allocate refine sets");
+    for (int i = 0; i < UP_SLOTS; ++i) g_up.slot[i].set_refine = sets[i];
+    if (with_cnn) {
+        for (int i = 0; i < UP_SLOTS; ++i) layouts[i] = g_up.dsl_cnn;
+        UP_CHECK(g_up.fn.allocate_descriptor_sets(up_dev(), &dsai, sets), "allocate CNN sets");
+        for (int i = 0; i < UP_SLOTS; ++i) g_up.slot[i].set_cnn = sets[i];
+    }
 
     /* The descriptor sets have to exist before the buffers they name, and the
      * extent-sized buffers before the command buffers that copy into them. */
@@ -640,9 +878,16 @@ int lsl_upscale_begin(const LslUpscaleShape *shape, VkSurfaceKHR surface, VkDevi
 
     /* write_sets() already ran, for the new plane buffers. */
     g_up.valid = 1;
-    lsl_log("scale: %ux%u -> %ux%u via FSR1 EASU+RCAS, %s pixels, queue family %u",
+    /* One line, driven off by tools/upscale-check.sh: it runs the layer for a
+     * method, greps this line to learn what was built, and compares the dumped
+     * frame against `lsl-upscale --modes <mode>`.  The mode really running is
+     * therefore on the line, and an LSL_LAYER_MODE=auto build says which
+     * method it resolved to. */
+    lsl_log("scale: %ux%u -> %ux%u via %s, %s pixels, queue family %u, "
+            "mode %s%s",
             shape->app_w, shape->app_h, shape->real_w, shape->real_h,
-            g_up.is16 ? "half-float" : "RGBA8", g_up.family);
+            lsl_mode_build_text(mode), g_up.is16 ? "half-float" : "RGBA8",
+            g_up.family, lsl_mode_name(mode), declared_auto ? " (auto)" : "");
 #undef UP_CHECK
 #undef UP_FAIL
     return 1;
@@ -751,55 +996,109 @@ static void up_record(UpSlot *s, VkImage image, int with_dump) {
 
     PushConst pc;
     memset(&pc, 0, sizeof(pc));
-    pc.srcW = W; pc.srcH = H; pc.dstW = N; pc.dstH = M; pc.mode = 4;
+    /* Every method's first pass.  The refined methods run EASU here and a
+     * second pass at destination resolution below; a pure spatial method is
+     * this single dispatch, and its result lands in `mid`. */
+    const int refined = mode_is_refined(g_up.mode);
+    pc.srcW = W; pc.srcH = H; pc.dstW = N; pc.dstH = M;
+    pc.mode = refined ? (uint32_t)LSL_MODE_FSR1 : g_up.mode;
     pc.sharpness = g_up.shape.sharpness;
-    g_up.fn.cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.pipe_easu);
+    g_up.fn.cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.pipe_scale);
     g_up.fn.cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.playout,
-                                  0, 1, &s->set_easu, 0, NULL);
+                                  0, 1, &s->set_scale, 0, NULL);
     g_up.fn.cmd_push_constants(cmd, g_up.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     g_up.fn.cmd_dispatch(cmd, UP_GROUPS(N), UP_GROUPS(M), 1);
 
-    /* The two dispatches share both buffers: EASU's output must be readable by
-     * RCAS, and `in` -- which EASU read -- becomes RCAS's output.  One barrier
-     * with two buffer entries expresses both dependencies. */
-    {
-        VkBufferMemoryBarrier bb[2];
-        memset(bb, 0, sizeof(bb));
-        bb[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        bb[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        bb[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        bb[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bb[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bb[0].buffer = s->mid;
-        bb[0].offset = 0;
-        bb[0].size = VK_WHOLE_SIZE;
-        bb[1] = bb[0];
-        bb[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        bb[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        bb[1].buffer = s->in;
+    if (refined) {
+        /* The next pass reads what the first one just wrote to `mid`, and it
+         * overwrites `in` -- which the first pass read.  One barrier with two
+         * buffer entries expresses both dependencies. */
+        VkBufferMemoryBarrier b[2];
+        memset(b, 0, sizeof(b));
+        b[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        b[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[0].buffer = s->mid;
+        b[0].offset = 0;
+        b[0].size = VK_WHOLE_SIZE;
+        b[1] = b[0];
+        b[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b[1].buffer = s->in;
         g_up.fn.cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL,
-                                  2, bb, 0, NULL);
+                                  2, b, 0, NULL);
     }
 
-    pc.srcW = N; pc.srcH = M; pc.dstW = N; pc.dstH = M; pc.mode = 0;
-    g_up.fn.cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.pipe_rcas);
-    g_up.fn.cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.playout,
-                                  0, 1, &s->set_rcas, 0, NULL);
-    g_up.fn.cmd_push_constants(cmd, g_up.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    g_up.fn.cmd_dispatch(cmd, UP_GROUPS(N), UP_GROUPS(M), 1);
+    if (g_up.mode == LSL_MODE_FSR1RCAS || g_up.mode == LSL_MODE_NIS) {
+        /* Both refiners are a 1:1 pass at destination resolution over `mid`,
+         * writing the finished frame into `in`.  RCAS uses `sharpness`; NIS
+         * ignores it and applies its own fixed tuning. */
+        pc.srcW = N; pc.srcH = M; pc.dstW = N; pc.dstH = M; pc.mode = 0;
+        if (g_up.mode != LSL_MODE_FSR1RCAS) pc.sharpness = 0.0f;
+        g_up.fn.cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  g_up.mode == LSL_MODE_FSR1RCAS ? g_up.pipe_rcas
+                                                                 : g_up.pipe_nis);
+        g_up.fn.cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.playout,
+                                      0, 1, &s->set_refine, 0, NULL);
+        g_up.fn.cmd_push_constants(cmd, g_up.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        g_up.fn.cmd_dispatch(cmd, UP_GROUPS(N), UP_GROUPS(M), 1);
+    } else if (g_up.mode == LSL_MODE_CNN) {
+        /* Four convolutions over two ping-ponged float planes.  The layer table
+         * -- generated alongside the weights -- says where each layer's
+         * matrices are and whether it splits, so the shader and the CPU
+         * reference read the same numbers; only the buffer roles differ per
+         * layer, and those are the flags below. */
+        for (uint32_t L = 0; L < (uint32_t)LSL_ANIME4K_LAYERS; ++L) {
+            if (L) {
+                /* The previous layer wrote one of the two planes; this one
+                 * reads it.  (L - 1) even means layer L-1 wrote A. */
+                up_buf_barrier(cmd, ((L - 1u) & 1u) ? s->cnn_b : s->cnn_a,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+            }
+            uint32_t flags = 0;
+            if (lsl_anime4k_layers[L].split)    flags |= LSL_CNN_SPLIT;
+            if (lsl_anime4k_layers[L].add_base) flags |= LSL_CNN_ADD_BASE;
+            if (L == 0) flags |= LSL_CNN_READ_BASE;
+            if (L == 1) flags |= LSL_CNN_DST_B;
+            if (L == 2) flags |= LSL_CNN_SRC_B;
+            if (L == (uint32_t)LSL_ANIME4K_LAYERS - 1u) flags |= LSL_CNN_WRITE_IMAGE;
 
-    up_buf_barrier(cmd, s->in, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            CnnPushConst cp;
+            cp.W = N;
+            cp.H = M;
+            cp.woff = (uint32_t)lsl_anime4k_layers[L].woff;
+            cp.boff = (uint32_t)lsl_anime4k_layers[L].boff;
+            cp.flags = flags;
+            g_up.fn.cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_up.pipe_cnn);
+            g_up.fn.cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          g_up.playout_cnn, 0, 1, &s->set_cnn, 0, NULL);
+            g_up.fn.cmd_push_constants(cmd, g_up.playout_cnn, VK_SHADER_STAGE_COMPUTE_BIT,
+                                       0, sizeof(cp), &cp);
+            g_up.fn.cmd_dispatch(cmd, UP_GROUPS_CNN(N), UP_GROUPS_CNN(M), 1);
+        }
+    }
+
+    /* Everything the shaders wrote has to be visible to the transfers below.
+     * `mid` holds the base result in every method; a refined method leaves the
+     * finished frame in `in`, a single-dispatch method leaves it in `mid`. */
+    up_buf_barrier(cmd, s->mid, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT,
                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    const VkBuffer outbuf = refined ? s->in : s->mid;
+    if (refined)
+        up_buf_barrier(cmd, s->in, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
     if (with_dump) {
-        /* mid still holds the EASU result: RCAS only reads it.  Copying it out
-         * as well lets tools/upscale-check.sh tell an EASU disagreement from an
-         * RCAS one. */
-        up_buf_barrier(cmd, s->mid, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        /* `mid` holds the base result and `outbuf` the finished frame, so
+         * tools/upscale-check.sh can tell a base disagreement from a refiner
+         * one.  A single-dispatch method leaves both in the same buffer. */
         VkBufferCopy c;
         memset(&c, 0, sizeof(c));
         c.srcOffset = 0;
@@ -811,7 +1110,7 @@ static void up_record(UpSlot *s, VkImage image, int with_dump) {
         c.srcOffset = 0;
         c.dstOffset = g_up.stage_out_off;
         c.size = (VkDeviceSize)N * M * texel;
-        g_up.fn.cmd_copy_buffer(cmd, s->in, g_up.stage, 1, &c);
+        g_up.fn.cmd_copy_buffer(cmd, outbuf, g_up.stage, 1, &c);
     }
 
     VkBufferImageCopy dst;
@@ -824,7 +1123,7 @@ static void up_record(UpSlot *s, VkImage image, int with_dump) {
     dst.imageExtent.width = N;
     dst.imageExtent.height = M;
     dst.imageExtent.depth = 1;
-    g_up.fn.cmd_copy_buffer_to_image(cmd, s->in, image,
+    g_up.fn.cmd_copy_buffer_to_image(cmd, outbuf, image,
                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &dst);
 
     up_img_barrier(cmd, image,

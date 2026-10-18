@@ -1,0 +1,161 @@
+// Anime4K v4 Restore CNN (S) -- the convolutional refinement lsl's `ai`/`cnn`
+// method runs after FSR1's EASU upscale.
+//
+// One dispatch per layer rather than one shader per layer: the pipeline is
+// identical for all four, and the push constant says which layer this is, so
+// the compiler sees one body and the driver sees one pipeline.  The weights
+// come from a buffer filled from the table tools/anime4k_weights.py generates
+// out of the vendored GLSL, which is also what src/cnn_ref.cpp reads, so the
+// reference and the shader cannot disagree about the numbers.
+//
+// Two scratch buffers hold the intermediate activations.  They are floats, not
+// the packed pixels of shaders/scale.comp, because a rectified convolution's
+// intermediate values are not colours and would lose real information in 8
+// bits.  Only the base image and the final result are packed.
+//
+//   layer 0: base (packed)        -> A
+//   layer 1: A  (relu split)      -> B
+//   layer 2: B  (relu split)      -> A
+//   layer 3: A  (relu split) + base-> the packed output
+//
+// Compiled twice, RGBA8 and half-float I/O, like shaders/scale.comp.  The
+// scratch buffers are always fp32; only the packed ends change.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(push_constant) uniform PC {
+    uint W, H;
+    uint woff;    // first weight of this layer, as a float index
+    uint boff;    // this layer's bias, as a float index
+    uint flags;   // see the FLAG_* constants below
+} p;
+
+#define FLAG_SPLIT      1u   // relu(x)/relu(-x) pair per tap
+#define FLAG_ADD_BASE   2u   // add the base image back at the end
+#define FLAG_READ_BASE  4u   // the input is the packed base image
+#define FLAG_WRITE_IMAGE 8u  // the output is the packed result
+#define FLAG_SRC_B      16u  // the input is scratch B rather than scratch A
+#define FLAG_DST_B      32u  // the output is scratch B rather than scratch A
+
+layout(set = 0, binding = 0, std430) readonly  buffer Base { uint  base[]; };
+layout(set = 0, binding = 1, std430)           buffer ScA  { float a[]; };
+layout(set = 0, binding = 2, std430)           buffer ScB  { float b[]; };
+layout(set = 0, binding = 3, std430) readonly  buffer Wts  { float w[]; };
+layout(set = 0, binding = 4, std430)           buffer Out  { uint  outb[]; };
+
+// The 3x3 order every Anime4K layer walks, checked against the source by
+// tools/anime4k_weights.py and matching lsl_anime4k_offsets in the generated
+// header.
+const int kOff[9][2] = {{-1, -1}, {-1, 0}, {-1, 1},
+                        {0, -1},  {0, 0},  {0, 1},
+                        {1, -1},  {1, 0},  {1, 1}};
+
+// --- packed image I/O ------------------------------------------------------
+// Same layouts shaders/scale.comp uses, so a packed buffer written by EASU
+// reads back here as the same colours.
+
+#ifdef LSL_IO_16F
+
+uint ioIndex(uint x, uint y, uint ww) { return 2u * (y * ww + x); }
+
+vec4 readBase(int x, int y)
+{
+    x = clamp(x, 0, int(p.W) - 1);
+    y = clamp(y, 0, int(p.H) - 1);
+    const uint i = ioIndex(uint(x), uint(y), p.W);
+    const vec2 lo = unpackHalf2x16(base[i]);
+    const vec2 hi = unpackHalf2x16(base[i + 1u]);
+    return vec4(lo.x, lo.y, hi.x, hi.y);
+}
+
+void writeImage(uint i, vec4 v)
+{
+    const vec4 n = vec4(clamp(v.rgb, 0.0, 1.0), 1.0);
+    outb[i]      = packHalf2x16(n.xy);
+    outb[i + 1u] = packHalf2x16(n.zw);
+}
+
+#else
+
+uint ioIndex(uint x, uint y, uint ww) { return y * ww + x; }
+
+vec4 readBase(int x, int y)
+{
+    x = clamp(x, 0, int(p.W) - 1);
+    y = clamp(y, 0, int(p.H) - 1);
+    return unpackUnorm4x8(base[ioIndex(uint(x), uint(y), p.W)]);
+}
+
+void writeImage(uint i, vec4 v)
+{
+    const vec3 n = clamp(v.rgb, 0.0, 1.0) * 255.0;
+    uvec3 c = clamp(uvec3(round(n)), uvec3(0u), uvec3(255u));
+    outb[i] = c.r | (c.g << 8) | (c.b << 16) | 0xff000000u;
+}
+
+#endif
+
+// --- activations -----------------------------------------------------------
+
+vec4 readScratch(uint i, bool fromB)
+{
+    return fromB ? vec4(b[i * 4u], b[i * 4u + 1u], b[i * 4u + 2u], b[i * 4u + 3u])
+                 : vec4(a[i * 4u], a[i * 4u + 1u], a[i * 4u + 2u], a[i * 4u + 3u]);
+}
+
+void writeScratch(uint i, vec4 v, bool toB)
+{
+    if (toB) {
+        b[i * 4u] = v.x; b[i * 4u + 1u] = v.y;
+        b[i * 4u + 2u] = v.z; b[i * 4u + 3u] = v.w;
+    } else {
+        a[i * 4u] = v.x; a[i * 4u + 1u] = v.y;
+        a[i * 4u + 2u] = v.z; a[i * 4u + 3u] = v.w;
+    }
+}
+
+// GLSL's mat4(...) is column major, so (M * v) is sum_col v[col] * column.
+vec4 applyMat(uint off, vec4 v)
+{
+    return vec4(w[off + 0u] * v.x + w[off + 4u] * v.y + w[off + 8u]  * v.z + w[off + 12u] * v.w,
+                w[off + 1u] * v.x + w[off + 5u] * v.y + w[off + 9u]  * v.z + w[off + 13u] * v.w,
+                w[off + 2u] * v.x + w[off + 6u] * v.y + w[off + 10u] * v.z + w[off + 14u] * v.w,
+                w[off + 3u] * v.x + w[off + 7u] * v.y + w[off + 11u] * v.z + w[off + 15u] * v.w);
+}
+
+void main()
+{
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= p.W || gid.y >= p.H) return;
+
+    const bool split     = (p.flags & FLAG_SPLIT) != 0u;
+    const bool add_base  = (p.flags & FLAG_ADD_BASE) != 0u;
+    const bool read_base = (p.flags & FLAG_READ_BASE) != 0u;
+    const bool write_img = (p.flags & FLAG_WRITE_IMAGE) != 0u;
+    const bool src_b     = (p.flags & FLAG_SRC_B) != 0u;
+    const bool dst_b     = (p.flags & FLAG_DST_B) != 0u;
+
+    vec4 acc = vec4(w[p.boff], w[p.boff + 1u], w[p.boff + 2u], w[p.boff + 3u]);
+
+    for (int t = 0; t < 9; ++t) {
+        const int sx = clamp(int(gid.x) + kOff[t][0], 0, int(p.W) - 1);
+        const int sy = clamp(int(gid.y) + kOff[t][1], 0, int(p.H) - 1);
+        const uint si = uint(sy) * p.W + uint(sx);
+
+        const vec4 v = read_base ? readBase(sx, sy) : readScratch(si, src_b);
+        // A split layer's go_0 matrices come first, then its go_1 matrices.
+        const uint wo = p.woff + uint(t) * 16u;
+
+        acc += applyMat(wo, max(v, vec4(0.0)));
+        // LSL_ANIME4K_GO1_OFFSET in the generated header: nine mat4 per tap set.
+        if (split) acc += applyMat(wo + 144u, max(-v, vec4(0.0)));
+    }
+
+    if (add_base) acc += readBase(int(gid.x), int(gid.y));
+
+    const uint oi = gid.y * p.W + gid.x;
+    if (write_img) writeImage(oi, acc);
+    else           writeScratch(oi, acc, dst_b);
+}

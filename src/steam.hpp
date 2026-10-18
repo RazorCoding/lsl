@@ -123,15 +123,20 @@ bool vdfWellFormed(const std::string& text);
 std::string steamOptionsClear(const std::string& existing,
                               const std::string& layer_dir);
 
-// Options with lsl enabled at this scale/sharpness, replacing any previous lsl
-// tokens.  `layer_dir` is the directory holding VkLayer_lsl_frame.json.
+// Options with lsl enabled at this scale/sharpness/method, replacing any
+// previous lsl tokens.  `layer_dir` is the directory holding
+// VkLayer_lsl_frame.json.  `method` is a LSL_LAYER_MODE value; anything
+// isModeName() does not accept is left out rather than written, so the layer's
+// own default applies.
 std::string steamOptionsApply(const std::string& existing,
                               const std::string& layer_dir, double scale,
-                              double sharpness);
+                              double sharpness, const std::string& method);
 
 // Read back the settings lsl is currently present with, for the GUI to show.
-// Returns false when these options do not enable lsl at all.
+// `method` receives LSL_LAYER_MODE when it is present and names something, and
+// is otherwise left alone.  Returns false when these options do not enable lsl
+// at all.
 bool steamOptionsParse(const std::string& existing, double* scale,
-                       double* sharpness);
+                       double* sharpness, std::string* method);
 
 }  // namespace lsl

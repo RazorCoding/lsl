@@ -137,14 +137,19 @@ int lsl_pick_memory_type(uint32_t bits, VkMemoryPropertyFlags want,
  *
  * The whole feature is: make the application render smaller than the surface by
  * lying about the surface capabilities, then push its frame back to full size
- * through the Phase 1 FSR1 chain (EASU, then RCAS) before the present lands.
+ * through the chosen method before the present lands.  Every method starts with
+ * the same present-time pipeline -- copy the frame into a buffer, upscale it
+ * with shaders/scale.comp, optionally refine at destination resolution -- so a
+ * method is only a choice of which passes run in between.  See the pass plan in
+ * lsl_upscale.c's up_record().
  * ------------------------------------------------------------------------- */
 
 typedef struct {
     VkFormat format;      /* swapchain format */
     uint32_t real_w, real_h;  /* the size the swapchain really is (N x M) */
     uint32_t app_w, app_h;    /* the size the application thinks it is (W x H) */
-    float sharpness;          /* RCAS strength, in stops */
+    float sharpness;          /* RCAS strength, in stops; only fsr1rcas uses it */
+    uint32_t mode;            /* an LSL_MODE_* value, or LSL_MODE_AUTO */
 } LslUpscaleShape;
 
 /* Build (or rebuild, if `shape` or the device changed) the compute pipeline and

@@ -23,8 +23,10 @@ set(LSL_SPV)
 # well as by the CPU reference so both compile the same algorithm.
 set(LSL_FFX_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx)
 # scale.comp holds the spatial scalers plus FSR1's EASU; rcas.comp is FSR1's
-# sharpening pass, run as a second dispatch over a scratch buffer.
-foreach(NAME scale rcas)
+# sharpening pass, run as a second dispatch over a scratch buffer; nis.comp is
+# the same idea with NVIDIA Image Scaling's sharpening; cnn.comp is the Anime4K
+# Restore CNN, a refinement pass made of four convolutions.
+foreach(NAME scale rcas nis cnn)
   set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${NAME}.comp)
   set(SPV ${LSL_SPV_DIR}/${NAME}.comp.spv)
   add_custom_command(
@@ -92,6 +94,27 @@ add_custom_command(
 add_custom_target(lsl_ffx_cpp DEPENDS ${LSL_FFX_CPP})
 
 # ---------------------------------------------------------------------------
+# Anime4K Restore CNN weights
+#
+# The `cnn` method's four convolutions come from bloc97's MIT-licensed GLSL,
+# vendored in third_party/anime4k.  The weight tables are generated from that
+# file (and validated: the generator refuses anything whose taps are not in the
+# one order the shader and the CPU reference walk), so the vendored source is
+# the only copy of the numbers anyone edits.
+# ---------------------------------------------------------------------------
+set(LSL_ANIME4K_GLSL ${CMAKE_CURRENT_SOURCE_DIR}/third_party/anime4k/Anime4K_Restore_CNN_S.glsl)
+set(LSL_ANIME4K_DIR ${CMAKE_CURRENT_BINARY_DIR}/anime4k)
+set(LSL_ANIME4K_H ${LSL_ANIME4K_DIR}/anime4k_restore_s.h)
+add_custom_command(
+  OUTPUT ${LSL_ANIME4K_H}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${LSL_ANIME4K_DIR}
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/anime4k_weights.py
+          ${LSL_ANIME4K_GLSL} ${LSL_ANIME4K_H}
+  DEPENDS ${LSL_ANIME4K_GLSL} ${CMAKE_CURRENT_SOURCE_DIR}/tools/anime4k_weights.py
+  COMMENT "generating anime4k_restore_s.h")
+add_custom_target(lsl_anime4k_weights DEPENDS ${LSL_ANIME4K_H})
+
+# ---------------------------------------------------------------------------
 # core library
 # ---------------------------------------------------------------------------
 add_library(lsl_core STATIC
@@ -99,8 +122,10 @@ add_library(lsl_core STATIC
   src/image_io.cpp
   src/reference.cpp
   src/fsr1_ref.cpp
+  src/nis_ref.cpp
+  src/cnn_ref.cpp
   ${LSL_BLOB})
-target_include_directories(lsl_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(lsl_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_BINARY_DIR} ${LSL_ANIME4K_DIR})
 target_include_directories(lsl_core PRIVATE ${LSL_FFX_DIR} ${LSL_FFX_CPP_DIR})
 target_link_libraries(lsl_core PUBLIC Vulkan::Vulkan)
 target_compile_options(lsl_core PRIVATE -Wall -Wextra)
@@ -109,7 +134,7 @@ target_compile_options(lsl_core PRIVATE -Wall -Wextra)
 # a*b+c into a fused multiply-add. Turning contraction off for this one file
 # keeps the two sides doing the same operations.
 set_source_files_properties(src/fsr1_ref.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
-add_dependencies(lsl_core lsl_shaders lsl_ffx_cpp)
+add_dependencies(lsl_core lsl_shaders lsl_ffx_cpp lsl_anime4k_weights)
 
 # ---------------------------------------------------------------------------
 # Steam configuration (the GUI's core)
@@ -169,13 +194,16 @@ endif()
 # the surface size and upscales the smaller frame it renders back to full
 # resolution with the Phase 1 FSR1 chain.
 # ---------------------------------------------------------------------------
-add_library(lsl-layer SHARED layer/lsl_layer.c layer/lsl_upscale.c ${LSL_BLOB_C})
+add_library(lsl-layer SHARED layer/lsl_layer.c layer/lsl_upscale.c layer/lsl_method.c ${LSL_BLOB_C})
 target_link_libraries(lsl-layer PRIVATE Vulkan::Vulkan)
 # -g unconditionally: when this layer misbehaves, the only useful evidence is a
 # core dump, and a backtrace without line numbers costs far more than the
 # symbols do.
 target_compile_options(lsl-layer PRIVATE -Wall -Wextra -g)
-target_include_directories(lsl-layer PRIVATE ${VULKAN_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(lsl-layer PRIVATE ${VULKAN_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR} ${LSL_ANIME4K_DIR})
+# lsl_upscale.c includes the generated Anime4K weight header, which is not a
+# source of this target, so the dependency has to be stated explicitly.
+add_dependencies(lsl-layer lsl_anime4k_weights)
 
 # The manifest has to carry an absolute library_path: the loader does not
 # resolve it relative to the manifest, which is exactly the reason the
@@ -215,7 +243,7 @@ add_test(NAME validation
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/validation-check.sh
                  $<TARGET_FILE:lsl-upscale>
                  --make-test 320x200 --dst 800x500 --bench 2
-                 --modes nearest,bilinear,cubic,lanczos2,fsr1,fsr1rcas)
+                 --modes nearest,bilinear,cubic,lanczos2,fsr1,fsr1rcas,lanczos3,nis,cnn)
 
 # End to end: vkcube runs with the layer injected (LSL_LAYER_SCALE=2), the layer
 # dumps the frame it upscaled at present time, and the same source is fed to

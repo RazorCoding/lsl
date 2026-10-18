@@ -17,6 +17,7 @@
 //     should hold for the user's configuration, so nothing is hidden.
 
 #include "profile.hpp"
+#include "method.hpp"
 #include "steam.hpp"
 
 #include <gtkmm.h>
@@ -117,6 +118,22 @@ std::string guessLayerDir() {
     return here + "/layer";
 }
 
+// The method dropdown's contents: "auto" first, then every name in
+// src/method.hpp's table.  Built from the table rather than written out, so a
+// method added there appears in the window too -- and the strings are the same
+// ones LSL_LAYER_MODE accepts, because they come from the same place.
+std::vector<std::string> methodNames() {
+    std::vector<std::string> v{"auto"};
+    for (unsigned m = 0; m < lsl::MODE_COUNT; ++m) v.push_back(lsl::modeName(m));
+    return v;
+}
+
+std::vector<Glib::ustring> methodLabels() {
+    std::vector<Glib::ustring> v{"Auto"};
+    for (unsigned m = 0; m < lsl::MODE_COUNT; ++m) v.push_back(lsl::modeLabel(m));
+    return v;
+}
+
 class Window : public Gtk::ApplicationWindow {
 public:
     Window();
@@ -150,6 +167,8 @@ private:
     // state
     const lsl::SteamGame* current() const;
     lsl::Profile widgetProfile() const;
+    std::string selectedMethod() const;
+    void setSelectedMethod(const std::string& name);
     void saveProfile();
     bool layerDirLooksRight() const;
 
@@ -162,6 +181,7 @@ private:
     Gtk::Switch* enable_ = nullptr;
     Gtk::SpinButton* scale_ = nullptr;
     Gtk::SpinButton* sharp_ = nullptr;
+    Gtk::DropDown* method_ = nullptr;
     Gtk::Entry* currentEntry_ = nullptr;
     Gtk::Entry* previewEntry_ = nullptr;
     Gtk::Entry* layerEntry_ = nullptr;
@@ -173,6 +193,9 @@ private:
 
     std::vector<lsl::SteamGame> games_;
     lsl::ProfileStore store_;
+    // The dropdown's rows, in the order methodLabels() produced them, so the
+    // widget and the strings the launch options take cannot disagree.
+    std::vector<std::string> methodNames_;
     std::string steamRoot_;
     std::string configPath_;
     std::string profilePath_;
@@ -333,9 +356,23 @@ void Window::buildWidgets() {
         "FSR1's RCAS strength, in stops: 0 is the strongest lobe AMD's RCAS "
         "applies, and each whole stop halves it, so larger values sharpen less "
         "and 4 is close to leaving the image alone.  Negative values sharpen "
-        "harder than AMD's default.");
+        "harder than AMD's default.  Only the FSR1 + RCAS method reads it; the "
+        "others have fixed tuning.");
     sharp_->signal_value_changed().connect([this] { onSettingsChanged(); });
     addRow(*details, "Sharpness", *sharp_);
+
+    methodNames_ = methodNames();
+    auto methodModel = Gtk::StringList::create(methodLabels());
+    method_ = Gtk::make_managed<Gtk::DropDown>(methodModel);
+    method_->set_hexpand(true);
+    method_->set_tooltip_text(
+        "Which filter the layer runs.  Auto picks one from the render size: AI "
+        "when the window is small enough for a 4-layer reconstruction to fit a "
+        "frame, NIS when the game renders well below the window, and "
+        "FSR1 + RCAS otherwise.  LSL_LAYER_MODE in the launch options.");
+    method_->property_selected().signal_changed().connect(
+        [this] { onSettingsChanged(); });
+    addRow(*details, "Upscaling method", *method_);
 
     details->append(*Gtk::make_managed<Gtk::Separator>(
         Gtk::Orientation::HORIZONTAL));
@@ -467,7 +504,26 @@ lsl::Profile Window::widgetProfile() const {
     profile.enabled = enable_->get_active();
     profile.scale = scale_->get_value();
     profile.sharpness = sharp_->get_value();
+    profile.method = selectedMethod();
     return profile;
+}
+
+// GTK_INVALID_LIST_POSITION (and an empty model) mean "nothing selected",
+// which the launch options read as a method the layer gets to pick.
+std::string Window::selectedMethod() const {
+    const guint i = method_->get_selected();
+    if (i == GTK_INVALID_LIST_POSITION || i >= methodNames_.size()) return "auto";
+    return methodNames_[i];
+}
+
+void Window::setSelectedMethod(const std::string& name) {
+    for (size_t i = 0; i < methodNames_.size(); ++i) {
+        if (methodNames_[i] == name) {
+            method_->set_selected(static_cast<guint>(i));
+            return;
+        }
+    }
+    method_->set_selected(0);  // "auto"
 }
 
 void Window::refreshDetails() {
@@ -476,7 +532,7 @@ void Window::refreshDetails() {
 
     enable_->set_sensitive(have);
     scale_->set_sensitive(have);
-    sharp_->set_sensitive(have);
+    method_->set_sensitive(have);
     apply_->set_sensitive(have);
     launch_->set_sensitive(have);
     currentEntry_->set_sensitive(have);
@@ -488,6 +544,10 @@ void Window::refreshDetails() {
                             ? "No game manifests were found.  Install a game, or "
                               "point lsl at another Steam library."
                             : "Choose a game on the left.");
+        loading_ = true;
+        setSelectedMethod("auto");
+        loading_ = false;
+        sharp_->set_sensitive(false);
         currentEntry_->set_text("");
         previewEntry_->set_text("");
         apply_->set_label("Apply to Steam");
@@ -499,8 +559,9 @@ void Window::refreshDetails() {
     std::string meta = "App " + game->appid;
     if (!game->library.empty()) meta += " in " + game->library;
     double currentScale = 0.0, currentSharpness = 0.0;
+    std::string currentMethod;
     if (lsl::steamOptionsParse(lsl::steamReadLaunchOptions(configPath_, game->appid),
-                               &currentScale, &currentSharpness)) {
+                               &currentScale, &currentSharpness, &currentMethod)) {
         meta += "  ·  lsl is already in this game's launch options";
     }
     meta_->set_text(meta);
@@ -510,7 +571,12 @@ void Window::refreshDetails() {
     enable_->set_active(profile.enabled);
     scale_->set_value(profile.scale);
     sharp_->set_value(profile.sharpness);
+    setSelectedMethod(profile.method);
     loading_ = false;
+
+    // Sharpness is RCAS's alone; the other methods ignore it, so an editable
+    // control would say otherwise.
+    sharp_->set_sensitive(have && selectedMethod() == "fsr1rcas");
 
     // Read the file rather than remembering what was written: what matters is
     // what Steam will do, not what lsl intended.
@@ -532,7 +598,7 @@ void Window::refreshPreview() {
     const std::string result =
         profile.enabled
             ? lsl::steamOptionsApply(existing, store_.layer_dir, profile.scale,
-                                     profile.sharpness)
+                                     profile.sharpness, profile.method)
             : lsl::steamOptionsClear(existing, store_.layer_dir);
 
     previewEntry_->set_text(result);
@@ -605,6 +671,9 @@ void Window::setStatus(const std::string& message, bool error) {
 
 void Window::onSettingsChanged() {
     if (loading_) return;
+    // Changing the method can make the sharpness box meaningless (it is RCAS's
+    // alone) or meaningful again.
+    sharp_->set_sensitive(current() != nullptr && selectedMethod() == "fsr1rcas");
     saveProfile();
     refreshPreview();
 }
@@ -635,7 +704,7 @@ void Window::onApplyClicked() {
     const std::string result =
         profile.enabled
             ? lsl::steamOptionsApply(existing, store_.layer_dir, profile.scale,
-                                     profile.sharpness)
+                                     profile.sharpness, profile.method)
             : lsl::steamOptionsClear(existing, store_.layer_dir);
 
     std::string error;
@@ -672,7 +741,8 @@ void Window::onLaunchClicked() {
         const std::string existing =
             lsl::steamReadLaunchOptions(configPath_, game->appid);
         double scale = 0.0, sharpness = 0.0;
-        if (!lsl::steamOptionsParse(existing, &scale, &sharpness)) {
+        std::string method;
+        if (!lsl::steamOptionsParse(existing, &scale, &sharpness, &method)) {
             setStatus("Launching, but this profile has not been applied to "
                       "Steam's launch options yet — press Apply first.",
                       true);
@@ -750,31 +820,49 @@ SteamData gatherSteamData() {
 
 int checkLaunchOptions(const SteamData& data) {
     int failures = 0;
+    // Every name the layer accepts has to survive apply-then-clear, and the
+    // method has to come back out of steamOptionsParse, which is what the
+    // window shows.  "auto" is the default; a method name exercises the rest.
+    const std::vector<std::string> methods = {"auto", "fsr1rcas", "nis", "cnn"};
     for (const lsl::SteamGame& game : data.games) {
         const std::string existing =
             lsl::steamReadLaunchOptions(data.config, game.appid);
-        const std::string applied =
-            lsl::steamOptionsApply(existing, data.layerDir, 2.0, 0.0);
+        for (const std::string& method : methods) {
+            const std::string applied = lsl::steamOptionsApply(
+                existing, data.layerDir, 2.0, 0.0, method);
 
-        const std::string roundTrip =
-            lsl::steamOptionsClear(applied, data.layerDir);
-        const std::string baseline =
-            lsl::steamOptionsClear(existing, data.layerDir);
-        if (roundTrip != baseline) {
-            ++failures;
-            std::printf("FAIL %s: apply then clear changed the options\n"
-                        "  before   [%s]\n"
-                        "  applied  [%s]\n"
-                        "  cleared  [%s]\n"
-                        "  baseline [%s]\n",
-                        game.appid.c_str(), existing.c_str(), applied.c_str(),
-                        roundTrip.c_str(), baseline.c_str());
-        }
+            const std::string roundTrip =
+                lsl::steamOptionsClear(applied, data.layerDir);
+            const std::string baseline =
+                lsl::steamOptionsClear(existing, data.layerDir);
+            if (roundTrip != baseline) {
+                ++failures;
+                std::printf("FAIL %s: apply then clear changed the options "
+                            "(method %s)\n"
+                            "  before   [%s]\n"
+                            "  applied  [%s]\n"
+                            "  cleared  [%s]\n"
+                            "  baseline [%s]\n",
+                            game.appid.c_str(), method.c_str(), existing.c_str(),
+                            applied.c_str(), roundTrip.c_str(), baseline.c_str());
+            }
 
-        if (lsl::steamOptionsApply(applied, data.layerDir, 2.0, 0.0) != applied) {
-            ++failures;
-            std::printf("FAIL %s: applying twice changed the options\n",
-                        game.appid.c_str());
+            double scale = 0.0, sharpness = 0.0;
+            std::string readBack;
+            if (lsl::steamOptionsParse(applied, &scale, &sharpness, &readBack) &&
+                readBack != method) {
+                ++failures;
+                std::printf("FAIL %s: wrote method %s, read back %s\n",
+                            game.appid.c_str(), method.c_str(),
+                            readBack.c_str());
+            }
+
+            if (lsl::steamOptionsApply(applied, data.layerDir, 2.0, 0.0,
+                                       method) != applied) {
+                ++failures;
+                std::printf("FAIL %s: applying twice changed the options\n",
+                            game.appid.c_str());
+            }
         }
     }
     return failures;

@@ -1,5 +1,7 @@
 #include "profile.hpp"
 
+#include "method.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -63,6 +65,12 @@ ProfileStore ProfileStore::load(const std::string& path) {
             p.enabled = enabled != 0;
             p.scale = scale;
             p.sharpness = sharpness;
+            // The method is the one field a Phase 3 file does not have.  It
+            // keeps the default -- auto -- when it is absent, and is refused
+            // when it names nothing the layer accepts, so a hand-edited typo
+            // degrades to the default instead of reaching the layer.
+            std::string method;
+            if (ls >> method && isModeName(method)) p.method = method;
             store.games[appid] = p;
         }
         // Unknown keys are ignored rather than fatal, so a newer GUI's file
@@ -85,13 +93,15 @@ bool ProfileStore::save(const std::string& path, std::string* error) const {
             return false;
         }
         out << "# lsl profiles.  One game per line:\n"
-               "#   game <appid> <enabled 0|1> <scale> <sharpness>\n"
-               "# Written by the lsl GUI; safe to edit by hand.\n";
+               "#   game <appid> <enabled 0|1> <scale> <sharpness> <method>\n"
+               "# <method> is a LSL_LAYER_MODE value: \"auto\", or one of the\n"
+               "# names in src/method.hpp.  Written by the lsl GUI; safe to edit\n"
+               "# by hand.\n";
         if (!layer_dir.empty()) out << "layer_dir " << layer_dir << "\n";
         for (const auto& [appid, profile] : games) {
             out << "game " << appid << ' ' << (profile.enabled ? 1 : 0) << ' '
                 << formatNumber(profile.scale) << ' '
-                << formatNumber(profile.sharpness) << "\n";
+                << formatNumber(profile.sharpness) << ' ' << profile.method << "\n";
         }
         if (!out) {
             *error = "short write to " + tmp;

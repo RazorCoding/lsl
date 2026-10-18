@@ -2,9 +2,12 @@
 // numbers: if the reference is wrong, every PSNR column in the benchmark is
 // meaningless.
 
+#include "cnn_ref.hpp"
 #include "image_io.hpp"
+#include "nis_ref.hpp"
 #include "reference.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +51,32 @@ uint8_t at(const lsl::Image& img, uint32_t x, uint32_t y, int c) {
     return img.rgba[(size_t(y) * img.w + x) * 4 + c];
 }
 
+// How each method is expected to behave on a degenerate input. The refiners --
+// RCAS inside fsr1rcas, NIS's sharpening, the CNN's residual -- all work at the
+// destination resolution and can move a level, so they get a tolerance. A pure
+// resampler reproduces a single texel exactly.
+int tileTolerance(uint32_t mode) {
+    return (mode == lsl::MODE_FSR1RCAS || mode == lsl::MODE_CNN) ? 1 : 0;
+}
+
+// The quality floor at 1:1. Everything through lanczos3 is mathematically
+// exact there and only pays for float accumulation; EASU is already a
+// sharpening resampler, and each refiner stacked on it spends a little more
+// fidelity on detail, so the floor relaxes the further down the pipeline the
+// method sits. These are the numbers the methods actually score, rounded down.
+double identityGate(uint32_t mode) {
+    switch (mode) {
+        case lsl::MODE_CUBIC:
+        case lsl::MODE_LANCZOS2:
+        case lsl::MODE_LANCZOS3: return 49.0;
+        case lsl::MODE_FSR1:
+        case lsl::MODE_FSR1RCAS: return 18.0;
+        case lsl::MODE_NIS:      return 30.0;
+        case lsl::MODE_CNN:      return 25.0;
+        default:                 return 90.0;  // nearest, bilinear
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -68,16 +97,16 @@ int main() {
 
     // --- 1x1 source must tile to one flat colour ---------------------------
     // Every pure scaler reproduces the single texel exactly everywhere. The
-    // full FSR1 chain lands within one level instead of exactly, because RCAS
+    // refiners land within one level instead of exactly: RCAS
     // divides by AMD's "medium precision" reciprocal (APrxMedRcpF1), which is
     // deliberately ~0.3% off so that it does not shift tonality - enough to
-    // round white down to 254.
+    // round white down to 254 - and the CNN's residual is not exactly zero for
+    // a constant field.
     {
         const Image one = solid(1, 1, 10, 200, 30);
         for (uint32_t mode = 0; mode < MODE_COUNT; ++mode) {
             const Image out = upscaleCPU(one, 17, 13, mode);
-            // fsr1rcas may be off by one level; everything else must be exact.
-            const int tol = (mode == MODE_FSR1RCAS) ? 1 : 0;
+            const int tol = tileTolerance(mode);
             bool flat = true;
             for (uint32_t y = 0; y < out.h && flat; ++y)
                 for (uint32_t x = 0; x < out.w && flat; ++x)
@@ -96,15 +125,9 @@ int main() {
         for (uint32_t mode = 0; mode < MODE_COUNT; ++mode) {
             const Image out = upscaleCPU(src, src.w, src.h, mode);
             const double p = psnrRGB(src, out);
-            // nearest and bilinear are exact at 1:1; cubic/lanczos are exact
-            // mathematically but pay for float accumulation. fsr1 and fsr1rcas
-            // are sharpening filters (EASU, then EASU+RCAS), so at 1:1 they only
-            // have to stay close - the tests below carry their real evidence.
-            const double gate = (mode == MODE_CUBIC || mode == MODE_LANCZOS2) ? 49.0
-                              : (mode == MODE_FSR1 || mode == MODE_FSR1RCAS) ? 18.0
-                              : 90.0;
-            check(p >= gate, std::string("identity scale ") + modeName(mode) +
-                                 " PSNR " + std::to_string(p));
+            check(p >= identityGate(mode),
+                  std::string("identity scale ") + modeName(mode) + " PSNR " +
+                      std::to_string(p));
         }
     }
 
@@ -385,10 +408,76 @@ int main() {
         check(out.w == 128 && out.h == 80, "fsr1rcas output dimensions");
     }
 
+    // --- the two new chains are exactly base-then-refiner too --------------
+    // Same reasoning: the GPU runs `nis` as EASU then NIS's sharpening, and
+    // `cnn` as EASU then four convolutions, all through scratch buffers. This
+    // pins the composition the GPU has to reproduce byte for byte.
+    {
+        const Image src = makeTestPattern(80, 50);
+        const Image easu = upscaleFSR1CPU(src, 128, 80);
+
+        const Image nis = upscaleCPU(src, 128, 80, MODE_NIS);
+        check(psnrRGB(nis, nisSharpenCPU(easu)) == 999.0,
+              "nis == nis-sharpen(fsr1) exactly");
+        check(nis.w == 128 && nis.h == 80, "nis output dimensions");
+
+        const Image cnn = upscaleCPU(src, 128, 80, MODE_CNN);
+        check(psnrRGB(cnn, anime4kRestoreCPU(easu)) == 999.0,
+              "cnn == anime4k-restore(fsr1) exactly");
+        check(cnn.w == 128 && cnn.h == 80, "cnn output dimensions");
+    }
+
+    // --- the CNN has to be a restoration network, not a tone map -----------
+    // A trained restore net is close to the identity on content that is already
+    // sharp and exactly the identity on a constant field. If the weight layout
+    // (column-major mat4, go_0 block then go_1 block) were wrong the output
+    // would be a wildly different colour, which is what this catches.
+    {
+        const Image flat = solid(32, 24, 91, 137, 213);
+        const Image out = anime4kRestoreCPU(flat);
+        int worst = 0;
+        for (size_t i = 0; i < size_t(out.w) * out.h; ++i) {
+            worst = std::max(worst, std::abs(int(out.rgba[i * 4 + 0]) - 91));
+            worst = std::max(worst, std::abs(int(out.rgba[i * 4 + 1]) - 137));
+            worst = std::max(worst, std::abs(int(out.rgba[i * 4 + 2]) - 213));
+        }
+        check(worst <= 2, "cnn keeps a flat colour flat (worst delta " +
+                              std::to_string(worst) + ")");
+    }
+
+    // --- NIS sharpening leaves flat colour alone ---------------------------
+    {
+        const Image flat = solid(32, 24, 91, 137, 213);
+        const Image out = nisSharpenCPU(flat);
+        bool same = true;
+        for (size_t i = 0; i < size_t(out.w) * out.h && same; ++i)
+            same = std::abs(int(out.rgba[i * 4 + 0]) - 91) <= 1 &&
+                   std::abs(int(out.rgba[i * 4 + 1]) - 137) <= 1 &&
+                   std::abs(int(out.rgba[i * 4 + 2]) - 213) <= 1;
+        check(same, "nis-sharpen leaves flat colour alone (within one level)");
+    }
+
     // --- mode names --------------------------------------------------------
     check(std::string(modeName(MODE_NEAREST)) == "nearest", "modeName(nearest)");
     check(std::string(modeName(MODE_LANCZOS2)) == "lanczos2", "modeName(lanczos2)");
+    check(std::string(modeName(MODE_LANCZOS3)) == "lanczos3", "modeName(lanczos3)");
     check(std::string(modeName(MODE_FSR1RCAS)) == "fsr1rcas", "modeName(fsr1rcas)");
+    check(std::string(modeName(MODE_NIS)) == "nis", "modeName(nis)");
+    check(std::string(modeName(MODE_CNN)) == "cnn", "modeName(cnn)");
+
+    // --- the name table round-trips, and "auto" is not a method ------------
+    // The launch options the GUI writes and the layer reads go through this
+    // table, so a missing or misspelled entry would silently write a name the
+    // layer cannot resolve. "auto" must never collide with a method.
+    {
+        for (uint32_t m = 0; m < MODE_COUNT; ++m)
+            check(methodIdFromName(modeName(m)) == int(m),
+                  std::string("mode name round-trips: ") + modeName(m));
+        check(methodIdFromName("auto") < 0, "\"auto\" is not a method name");
+        check(isAutoMethod("auto") && !isAutoMethod("") &&
+                  !isAutoMethod("fsr1rcas"),
+              "isAutoMethod recognises only \"auto\"");
+    }
 
     std::printf("\n%d checks, %d failure(s)\n", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

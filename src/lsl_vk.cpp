@@ -270,17 +270,21 @@ VkPipelineLayout Context::createLayout(VkPushConstantRange pcr,
 }
 
 VkDescriptorSetLayout Context::createSetLayout() const {
-    VkDescriptorSetLayoutBinding bindings[2]{};
-    for (int i = 0; i < 2; ++i) {
-        bindings[i].binding         = uint32_t(i);
+    return createSetLayoutN(2);
+}
+
+VkDescriptorSetLayout Context::createSetLayoutN(uint32_t count) const {
+    std::vector<VkDescriptorSetLayoutBinding> bindings(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        bindings[i].binding         = i;
         bindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
     }
     VkDescriptorSetLayoutCreateInfo ci{};
     ci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ci.bindingCount = 2;
-    ci.pBindings    = bindings;
+    ci.bindingCount = count;
+    ci.pBindings    = bindings.data();
     VkDescriptorSetLayout l = VK_NULL_HANDLE;
     LSL_VK_CHECK(vkCreateDescriptorSetLayout(dev_, &ci, nullptr, &l),
                  "vkCreateDescriptorSetLayout");
@@ -319,6 +323,12 @@ VkDescriptorPool Context::createPool() const {
 
 VkDescriptorSet Context::allocSet(VkDescriptorPool pool, VkDescriptorSetLayout lay,
                                   Buffer src, Buffer dst) const {
+    const Buffer bufs[2] = {src, dst};
+    return allocSetN(pool, lay, bufs, 2);
+}
+
+VkDescriptorSet Context::allocSetN(VkDescriptorPool pool, VkDescriptorSetLayout lay,
+                                   const Buffer* buffers, uint32_t count) const {
     VkDescriptorSetAllocateInfo ai{};
     ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     ai.descriptorPool     = pool;
@@ -327,20 +337,20 @@ VkDescriptorSet Context::allocSet(VkDescriptorPool pool, VkDescriptorSetLayout l
     VkDescriptorSet set = VK_NULL_HANDLE;
     LSL_VK_CHECK(vkAllocateDescriptorSets(dev_, &ai, &set), "vkAllocateDescriptorSets");
 
-    VkDescriptorBufferInfo infos[2] = {
-        {src.buf, 0, src.size},
-        {dst.buf, 0, dst.size},
-    };
-    VkWriteDescriptorSet writes[2]{};
-    for (int i = 0; i < 2; ++i) {
-        writes[i].sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet           = set;
-        writes[i].dstBinding       = uint32_t(i);
-        writes[i].descriptorCount  = 1;
-        writes[i].descriptorType   = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo      = &infos[i];
+    std::vector<VkDescriptorBufferInfo> infos(count);
+    std::vector<VkWriteDescriptorSet> writes(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        infos[i].buffer = buffers[i].buf;
+        infos[i].offset = 0;
+        infos[i].range  = buffers[i].size;
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = set;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &infos[i];
     }
-    vkUpdateDescriptorSets(dev_, 2, writes, 0, nullptr);
+    vkUpdateDescriptorSets(dev_, count, writes.data(), 0, nullptr);
     return set;
 }
 

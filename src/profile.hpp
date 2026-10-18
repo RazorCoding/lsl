@@ -17,6 +17,12 @@ struct Profile {
     bool enabled = false;
     double scale = 2.0;
     double sharpness = 0.0;
+    // Which filter the layer runs, as a LSL_LAYER_MODE= value: a name from
+    // methodTable(), or "auto". Named rather than numeric so the profile and
+    // the launch options read the same, and so this file cannot silently change
+    // meaning if an id is ever renumbered. The default is to let the layer
+    // choose, which is also what a game that has never been configured gets.
+    std::string method = "auto";
 };
 
 struct ProfileStore {

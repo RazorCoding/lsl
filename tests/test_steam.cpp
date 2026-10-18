@@ -217,17 +217,17 @@ void testVdfWellFormed() {
 // ----------------------------------------------------------- launch options
 
 void testOptionsApplyBasic() {
-    checkEq(lsl::steamOptionsApply("", "/lsl/layer", 2.0, 0.0),
-            "LSL_LAYER_SCALE=2 LSL_LAYER_SHARPNESS=0 "
+    checkEq(lsl::steamOptionsApply("", "/lsl/layer", 2.0, 0.0, "auto"),
+            "LSL_LAYER_SCALE=2 LSL_LAYER_SHARPNESS=0 LSL_LAYER_MODE=auto "
             "VK_ADD_LAYER_PATH=/lsl/layer "
             "VK_INSTANCE_LAYERS=VK_LAYER_LSL_frame %command%",
             "options: written from nothing");
 
-    const std::string once = lsl::steamOptionsApply("", "/lsl/layer", 2.0, 0.0);
-    checkEq(lsl::steamOptionsApply(once, "/lsl/layer", 2.0, 0.0), once,
+    const std::string once = lsl::steamOptionsApply("", "/lsl/layer", 2.0, 0.0, "auto");
+    checkEq(lsl::steamOptionsApply(once, "/lsl/layer", 2.0, 0.0, "auto"), once,
             "options: applying twice changes nothing");
 
-    const std::string twice = lsl::steamOptionsApply(once, "/lsl/layer", 1.5, 0.25);
+    const std::string twice = lsl::steamOptionsApply(once, "/lsl/layer", 1.5, 0.25, "auto");
     check(has(twice, "LSL_LAYER_SCALE=1.5 "),
           "options: a new scale is written");
     check(!has(twice, "LSL_LAYER_SCALE=2 "),
@@ -237,17 +237,17 @@ void testOptionsApplyBasic() {
 }
 
 void testOptionsScaleFormatting() {
-    const std::string a = lsl::steamOptionsApply("", "/d", 1.5, 0.25);
+    const std::string a = lsl::steamOptionsApply("", "/d", 1.5, 0.25, "auto");
     check(has(a, "LSL_LAYER_SCALE=1.5 "), "options: 1.5 is written as 1.5");
     check(has(a, "LSL_LAYER_SHARPNESS=0.25 "), "options: 0.25 as 0.25");
-    const std::string b = lsl::steamOptionsApply("", "/d", 3.0, 0.0);
+    const std::string b = lsl::steamOptionsApply("", "/d", 3.0, 0.0, "auto");
     check(has(b, "LSL_LAYER_SCALE=3 "), "options: 3.0 is written as 3");
 }
 
 void testOptionsKeepUserTokens() {
     // Exactly the shape the real localconfig on this machine had.
     const std::string before = "ENABLE_LSFG=1 DXVK_HUD=compiler %command%";
-    const std::string got = lsl::steamOptionsApply(before, "/lsl/layer", 2.0, 0.0);
+    const std::string got = lsl::steamOptionsApply(before, "/lsl/layer", 2.0, 0.0, "auto");
     check(has(got, "ENABLE_LSFG=1 "), "options: the user's own environment stays");
     check(has(got, "DXVK_HUD=compiler "), "options: the user's own arguments stay");
     check(has(got, "VK_ADD_LAYER_PATH=/lsl/layer"),
@@ -263,7 +263,7 @@ void testOptionsKeepUserTokens() {
 void testOptionsMissingCommand() {
     // No %command%: Steam would append the whole string to the game's command
     // line, so the assignments would arrive as arguments instead of environment.
-    const std::string got = lsl::steamOptionsApply("-dx11 -novid", "/d", 2.0, 0.0);
+    const std::string got = lsl::steamOptionsApply("-dx11 -novid", "/d", 2.0, 0.0, "auto");
     check(has(got, "%command%"), "options: %command% is added when missing");
     check(got.find("VK_INSTANCE_LAYERS=") < got.find("%command%"),
           "options: the assignments precede it");
@@ -276,7 +276,7 @@ void testOptionsMissingCommand() {
 void testOptionsMergeInstanceLayers() {
     const std::string before =
         "VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation %command%";
-    const std::string got = lsl::steamOptionsApply(before, "/d", 2.0, 0.0);
+    const std::string got = lsl::steamOptionsApply(before, "/d", 2.0, 0.0, "auto");
     check(has(got, "VK_INSTANCE_LAYERS=VK_LAYER_LSL_frame:"
                    "VK_LAYER_KHRONOS_validation"),
           "options: the user's own instance layers are kept, ours first");
@@ -286,7 +286,7 @@ void testOptionsMergeInstanceLayers() {
 
 void testOptionsMergeAddLayerPath() {
     const std::string before = "VK_ADD_LAYER_PATH=/other/layers %command%";
-    const std::string got = lsl::steamOptionsApply(before, "/lsl/layer", 2.0, 0.0);
+    const std::string got = lsl::steamOptionsApply(before, "/lsl/layer", 2.0, 0.0, "auto");
     check(has(got, "VK_ADD_LAYER_PATH=/lsl/layer:/other/layers"),
           "options: our path goes in front of the user's");
     checkEq(lsl::steamOptionsClear(got, "/lsl/layer"), before,
@@ -298,7 +298,7 @@ void testOptionsQuotedValues() {
     // would split into two arguments.
     const std::string before = "VK_ADD_LAYER_PATH=\"/my layers\" %command%";
     const std::string got =
-        lsl::steamOptionsApply(before, "/lsl layer/dir", 2.0, 0.0);
+        lsl::steamOptionsApply(before, "/lsl layer/dir", 2.0, 0.0, "auto");
     check(has(got, "VK_ADD_LAYER_PATH=\"/lsl layer/dir:/my layers\""),
           "options: a value with spaces is quoted");
     checkEq(lsl::steamOptionsClear(got, "/lsl layer/dir"), before,
@@ -306,14 +306,66 @@ void testOptionsQuotedValues() {
 }
 
 void testOptionsParse() {
-    const std::string s = lsl::steamOptionsApply("", "/d", 1.25, 0.5);
+    const std::string s = lsl::steamOptionsApply("", "/d", 1.25, 0.5, "cnn");
     double scale = 0, sharp = 0;
-    check(lsl::steamOptionsParse(s, &scale, &sharp),
+    std::string method;
+    check(lsl::steamOptionsParse(s, &scale, &sharp, &method),
           "options: the settings are found again");
     check(scale > 1.24 && scale < 1.26, "options: the scale reads back");
     check(sharp > 0.49 && sharp < 0.51, "options: the sharpness reads back");
-    check(!lsl::steamOptionsParse("DXVK_HUD=compiler %command%", &scale, &sharp),
+    checkEq(method, "cnn", "options: the method reads back");
+    check(!lsl::steamOptionsParse("DXVK_HUD=compiler %command%", &scale, &sharp,
+                                  &method),
           "options: absence is reported when lsl is not set");
+}
+
+void testOptionsMethod() {
+    const std::string m = lsl::steamOptionsApply("", "/d", 2.0, 0.0, "nis");
+    check(has(m, "LSL_LAYER_MODE=nis "), "options: the method is written");
+    check(has(m, "LSL_LAYER_SHARPNESS=0 LSL_LAYER_MODE=nis "),
+          "options: the method follows the sharpness");
+
+    // Every name the layer accepts has to survive a re-apply unchanged, and
+    // "auto" -- the default -- has to be one of them.  The list is spelled out
+    // rather than read from method.hpp so that a name being *dropped* from the
+    // table fails here instead of silently passing.
+    const std::vector<std::string> names = {
+        "auto",    "nearest", "bilinear", "cubic", "lanczos2",
+        "fsr1",    "fsr1rcas", "lanczos3", "nis",   "cnn"};
+    for (const std::string& name : names) {
+        const std::string once =
+            lsl::steamOptionsApply("", "/d", 2.0, 0.0, name);
+        check(has(once, "LSL_LAYER_MODE=" + name + " "),
+              "options: " + name + " is written");
+        checkEq(lsl::steamOptionsApply(once, "/d", 2.0, 0.0, name), once,
+                "options: re-applying " + name + " changes nothing");
+
+        double scale = 0, sharp = 0;
+        std::string readBack = "sentinel";
+        check(lsl::steamOptionsParse(once, &scale, &sharp, &readBack),
+              "options: " + name + " is found");
+        checkEq(readBack, name, "options: " + name + " reads back");
+    }
+
+    // A name the layer does not accept is not written at all, and the reader
+    // leaves the caller's value alone rather than showing a method that does
+    // not exist.
+    check(!has(lsl::steamOptionsApply("", "/d", 2.0, 0.0, "fsr9"), "LSL_LAYER_MODE"),
+          "options: an unknown method writes no variable");
+    double scale = 0, sharp = 0;
+    std::string keep = "auto";
+    check(lsl::steamOptionsParse("LSL_LAYER_SCALE=2 LSL_LAYER_MODE=wat %command%",
+                                 &scale, &sharp, &keep),
+          "options: an unsettable mode is still a string with the scale in it");
+    checkEq(keep, "auto", "options: an unknown mode leaves the caller's value");
+
+    // Switching method replaces the old one rather than accumulating.
+    const std::string nis = lsl::steamOptionsApply("", "/d", 2.0, 0.0, "nis");
+    const std::string cnn = lsl::steamOptionsApply(nis, "/d", 2.0, 0.0, "cnn");
+    check(!has(cnn, "LSL_LAYER_MODE=nis"), "options: the old method is gone");
+    check(has(cnn, "LSL_LAYER_MODE=cnn "), "options: the new method is there");
+    checkEq(lsl::steamOptionsClear(cnn, "/d"), "",
+            "options: the method does not survive a clear");
 }
 
 // -------------------------------------------------------------- Steam files
@@ -399,7 +451,7 @@ void testSteamWrites() {
 
     const std::string before = readFile(config);
     const std::string options = lsl::steamOptionsApply(
-        lsl::steamReadLaunchOptions(config, "730"), "/lsl/layer", 2.0, 0.0);
+        lsl::steamReadLaunchOptions(config, "730"), "/lsl/layer", 2.0, 0.0, "auto");
     std::string error;
     check(lsl::steamWriteLaunchOptions(config, "730", options, &error),
           "write: succeeds (" + error + ")");
@@ -430,7 +482,7 @@ void testSteamWrites() {
     std::string error2;
     check(lsl::steamWriteLaunchOptions(
               config, "1465360",
-              lsl::steamOptionsApply("", "/lsl/layer", 2.0, 0.0), &error2),
+              lsl::steamOptionsApply("", "/lsl/layer", 2.0, 0.0, "auto"), &error2),
           "write: creates a block for a game Steam has not seen (" + error2 + ")");
     check(has(lsl::steamReadLaunchOptions(config, "1465360"),
               "VK_LAYER_LSL_frame"),
@@ -465,11 +517,12 @@ void testProfileStore() {
     check(fresh.games.empty(), "profiles: a missing file loads empty");
     check(fresh.get("730").scale == 2.0, "profiles: the default scale is 2");
     check(!fresh.get("730").enabled, "profiles: a game starts disabled");
+    checkEq(fresh.get("730").method, "auto", "profiles: the default method is auto");
 
     lsl::ProfileStore store;
     store.layer_dir = "/home/me/My Projects/lsl/build/layer";
-    store.set("730", {true, 1.5, 0.25});
-    store.set("1465360", {false, 2.0, 0.0});
+    store.set("730", {true, 1.5, 0.25, "nis"});
+    store.set("1465360", {false, 2.0, 0.0, "auto"});
     std::string error;
     check(store.save(path, &error), "profiles: save (" + error + ")");
 
@@ -479,6 +532,8 @@ void testProfileStore() {
     check(back.get("730").enabled, "profiles: enabled round-trips");
     check(back.get("730").scale == 1.5, "profiles: scale round-trips");
     check(back.get("730").sharpness == 0.25, "profiles: sharpness round-trips");
+    checkEq(back.get("730").method, "nis", "profiles: the method round-trips");
+    checkEq(back.get("1465360").method, "auto", "profiles: auto round-trips");
     check(back.games.size() == 2, "profiles: both games round-trip");
     check(!back.get("999").enabled && back.get("999").scale == 2.0,
           "profiles: an unconfigured game gets the defaults");
@@ -493,6 +548,13 @@ void testProfileStore() {
     const lsl::ProfileStore tolerant = lsl::ProfileStore::load(path);
     checkEq(tolerant.layer_dir, "/x", "profiles: unknown keys are skipped");
     check(tolerant.get("1").scale == 3.0, "profiles: the rest still loads");
+    checkEq(tolerant.get("1").method, "auto",
+            "profiles: a line without a method gets the default");
+
+    // A method the layer would not accept is the default, not the typo.
+    writeFile(path, "game 2 1 2 0 game-of-thrones\n");
+    checkEq(lsl::ProfileStore::load(path).get("2").method, "auto",
+            "profiles: an unknown method falls back to auto");
 
     fs::remove_all(dir);
 }
@@ -533,6 +595,7 @@ int main() {
     testOptionsMergeAddLayerPath();
     testOptionsQuotedValues();
     testOptionsParse();
+    testOptionsMethod();
     testSteamDiscovery();
     testSteamWrites();
     testProfileStore();
