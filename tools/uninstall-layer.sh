@@ -13,6 +13,7 @@
 set -eu
 
 PREFIX="${PREFIX:-$HOME/.local}"
+DISK_PREFIX="${DESTDIR:-}${PREFIX}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -24,7 +25,7 @@ done
 
 # The implicit copy first: if it is still there when the search below runs, the
 # search could find it and then "remove" a directory that is not a layer dir.
-IMPLICIT="$PREFIX/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json"
+IMPLICIT="$DISK_PREFIX/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json"
 if [[ -f "$IMPLICIT" ]]; then
   rm -f "$IMPLICIT"
   rmdir "$(dirname "$IMPLICIT")" 2>/dev/null || true
@@ -32,7 +33,7 @@ if [[ -f "$IMPLICIT" ]]; then
   echo "removed:    $IMPLICIT"
 fi
 
-MANIFEST="$(find "$PREFIX" -path '*/lsl/layer/VkLayer_lsl_frame.json' -print -quit 2>/dev/null || true)"
+MANIFEST="$(find "$DISK_PREFIX" -path '*/lsl/layer/VkLayer_lsl_frame.json' -print -quit 2>/dev/null || true)"
 if [[ -z "$MANIFEST" ]]; then
   echo "uninstall-layer: no layer directory under $PREFIX"
   exit 0

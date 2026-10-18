@@ -50,6 +50,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+DISK_PREFIX="${DESTDIR:-}${PREFIX}"
 case "$BUILD" in /*) ;; *) BUILD="$ROOT/$BUILD" ;; esac
 
 if [[ ! -f "$BUILD/CMakeCache.txt" ]]; then
@@ -69,7 +70,7 @@ cmake --install "$BUILD" --prefix "$PREFIX"
 # rather than guessing the directory.  Restricted to lsl/layer: a --implicit
 # install leaves a second copy of the manifest in the loader's directory, and
 # this has to keep finding the one the launch-options line points at.
-MANIFEST="$(find "$PREFIX" -path '*/lsl/layer/VkLayer_lsl_frame.json' -print -quit 2>/dev/null || true)"
+MANIFEST="$(find "$DISK_PREFIX" -path '*/lsl/layer/VkLayer_lsl_frame.json' -print -quit 2>/dev/null || true)"
 if [[ -z "$MANIFEST" ]]; then
   echo "install-layer: the install wrote no manifest under $PREFIX" >&2
   exit 1
@@ -82,7 +83,7 @@ if [[ -z "$LIB" || "$LIB" != /* ]]; then
   echo "install-layer: $MANIFEST has a non-absolute library_path: '${LIB}'" >&2
   exit 1
 fi
-if [[ ! -f "$LIB" ]]; then
+if [[ ! -f "${DESTDIR:-}$LIB" ]]; then
   echo "install-layer: the manifest names a library that is not there:" >&2
   echo "  $LIB" >&2
   exit 1
@@ -93,7 +94,7 @@ fi
 # a file it scans on its own instead of one a launch line adds.
 IMPLICIT_DIR=
 if [[ "$DO_IMPLICIT" -eq 1 ]]; then
-  IMPLICIT_DIR="$PREFIX/share/vulkan/implicit_layer.d"
+  IMPLICIT_DIR="$DISK_PREFIX/share/vulkan/implicit_layer.d"
   mkdir -p "$IMPLICIT_DIR"
   cp "$MANIFEST" "$IMPLICIT_DIR/VkLayer_lsl_frame.json"
 fi

@@ -1,0 +1,21 @@
+pkgbase = lsl
+	pkgdesc = Lossless Scaling-style Linux Vulkan compute upscaler + GTK4 GUI (per-game profiles, implicit layer)
+	pkgver = r12.e0ed2f6
+	pkgrel = 1
+	url = https://github.com/RazorCoding/lsl
+	arch = x86_64
+	license = MIT
+	makedepends = cmake
+	makedepends = ninja
+	makedepends = vulkan-headers
+	makedepends = pkgconf
+	depends = vulkan-icd-loader
+	depends = gtkmm-4.0
+	depends = python
+	optdepends = vulkan-tools: vkcube test driver
+	optdepends = steam: game launching via steam -applaunch
+	options = !strip
+	source = git+https://github.com/RazorCoding/lsl.git
+	sha256sums = SKIP
+
+pkgname = lsl
