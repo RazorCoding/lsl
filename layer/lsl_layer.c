@@ -1004,13 +1004,18 @@ VKAPI_ATTR void VKAPI_CALL lsl_DestroyDevice(VkDevice dev,
      * in the same process must not free it. */
     if (lsl_upscale_device() == dev) lsl_upscale_end();
     capture_end(dev);
+    /* Resolve the device's own chain *before* forget_device() removes it from
+     * g_devs[]: afterwards dev_gdpa() falls back to the global (last-created)
+     * chain, which can belong to a frame-generation layer's helper device and
+     * make the forward below skip that layer's teardown -- leaking its objects. */
+    PFN_vkGetDeviceProcAddr gdpa = dev_gdpa(dev);
     forget_device(dev);
     memset(g_chains, 0, sizeof(g_chains));
     memset(g_queues, 0, sizeof(g_queues));
     g_queue_count = 0;
     g_device = VK_NULL_HANDLE;
-    if (!g_next_gdpa) return;
-    PFN_vkDestroyDevice next = (PFN_vkDestroyDevice)g_next_gdpa(dev, "vkDestroyDevice");
+    if (!gdpa) return;
+    PFN_vkDestroyDevice next = (PFN_vkDestroyDevice)gdpa(dev, "vkDestroyDevice");
     if (next) next(dev, ac);
 }
 
