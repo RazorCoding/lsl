@@ -57,6 +57,7 @@
  */
 
 #include "lsl_layer.h"
+#include "lsl_config.h"
 #include "lsl_method.h"
 
 #include <vulkan/vk_layer.h>
@@ -253,6 +254,10 @@ static void log_open(void) {
 }
 
 void lsl_log(const char *fmt, ...) {
+    /* A no-op process stays quiet.  This matters once the layer is installed as
+     * an implicit layer, where it is loaded into every Vulkan application on the
+     * machine and almost all of them are not games lsl was asked to touch. */
+    if (!lsl_log_enabled()) return;
     va_list ap;
     log_open();
     fprintf(g_log, "[lsl-layer %ld] ", (long)getpid());
@@ -344,43 +349,16 @@ static int capture_wanted(void) {
     return 1;
 }
 
-/* LSL_LAYER_SCALE is the upscale factor: 2 means "render at half size". */
-static float upscale_scale(void) {
-    static float v = -1.0f;
-    if (v < 0.0f) {
-        const char *e = getenv("LSL_LAYER_SCALE");
-        v = (e && *e) ? strtof(e, NULL) : 0.0f;
-        if (!(v > 0.0f)) v = 0.0f;
-    }
-    return v;
-}
+/* The settings for this process, resolved once, in lsl_config.c.  Both ways in
+ * -- an explicit LSL_LAYER_SCALE, or the GUI's profile for this SteamAppId --
+ * end up here, and everything below treats them the same. */
+static float upscale_scale(void) { return lsl_config()->scale; }
 
-static int scaling(void) { return upscale_scale() > 1.0f; }
+static int scaling(void) { return lsl_config()->enabled; }
 
-static float upscale_sharpness(void) {
-    const char *e = getenv("LSL_LAYER_SHARPNESS");
-    return (e && *e) ? strtof(e, NULL) : 0.0f;
-}
+static float upscale_sharpness(void) { return lsl_config()->sharpness; }
 
-/* LSL_LAYER_MODE names the upscaling method.  An unset or empty value keeps
- * the historical default -- FSR1's EASU followed by RCAS -- so a launch
- * options string written before the methods existed still means what it did.
- * "auto" is resolved by the engine, once per swapchain.  A name the layer does
- * not know is the default plus one warning, rather than a refusal to upscale:
- * a typo should cost a log line, not the feature. */
-static uint32_t upscale_mode(void) {
-    static uint32_t mode;
-    static int init;
-    if (!init) {
-        init = 1;
-        const char *e = getenv("LSL_LAYER_MODE");
-        uint32_t m = LSL_MODE_FSR1RCAS;
-        if (e && *e && lsl_mode_parse(e, &m) != 0)
-            lsl_log("scale: unknown LSL_LAYER_MODE=\"%s\"; using the default", e);
-        mode = m;
-    }
-    return mode;
-}
+static uint32_t upscale_mode(void) { return lsl_config()->mode; }
 
 /* ------------------------------------------------------------------- chains */
 

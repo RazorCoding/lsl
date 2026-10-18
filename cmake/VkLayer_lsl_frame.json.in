@@ -1,5 +1,5 @@
 {
-    "file_format_version": "1.0.0",
+    "file_format_version": "1.1.0",
     "layer": {
         "name": "VK_LAYER_LSL_frame",
         "type": "GLOBAL",
@@ -10,6 +10,9 @@
         "functions": {
             "vkGetInstanceProcAddr": "vkGetInstanceProcAddr",
             "vkGetDeviceProcAddr": "vkGetDeviceProcAddr"
+        },
+        "disable_environment": {
+            "LSL_LAYER_DISABLE": "1"
         }
     }
 }

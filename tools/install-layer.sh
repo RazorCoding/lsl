@@ -2,14 +2,22 @@
 #
 # Install the layer somewhere stable, so a game can use it without this tree.
 #
-# The layer is enabled per game from its Steam launch options, not globally, so
-# "installing" it means putting the shared object and its manifest where they
-# will stay put and pointing the launch line at them.  This deliberately does
-# *not* install under vulkan/implicit_layer.d: that would load the layer into
-# every Vulkan application on the machine, which is not what a per-game upscaler
-# should do.
+# There are two ways to enable it, and --implicit chooses between them:
 #
-#   tools/install-layer.sh [--prefix DIR] [--build DIR] [--no-build]
+#   (default)     Put the layer where a launch-options line can point at it.
+#                 The line names the layer and the scale together, and only the
+#                 game it is written for loads it.  lsl-gui writes that line.
+#
+#   --implicit    Additionally drop the manifest into the loader's own
+#                 implicit-layer directory, so the loader loads the layer into
+#                 every Vulkan process without being asked.  The layer then
+#                 decides, from the SteamAppId Steam puts in a game's
+#                 environment, whether this process is one the GUI enabled; a
+#                 process that is not stays silent and does nothing.  This is
+#                 what lets a game upscale from the GUI alone -- no launch
+#                 options, nothing in Steam's configuration, no restart.
+#
+#   tools/install-layer.sh [--prefix DIR] [--build DIR] [--no-build] [--implicit]
 #
 # The layer lands in <prefix>/lib/lsl/layer (or lib64, whichever GNUInstallDirs
 # picks) -- the same layout the build tree's build/layer has, so the GUI's
@@ -25,9 +33,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 BUILD="${ROOT}/build"
 DO_BUILD=1
+DO_IMPLICIT=0
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -35,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
     --build)  BUILD="${2:?--build needs a directory}"; shift 2 ;;
     --no-build) DO_BUILD=0; shift ;;
+    --implicit) DO_IMPLICIT=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "install-layer: unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -56,8 +66,10 @@ fi
 cmake --install "$BUILD" --prefix "$PREFIX"
 
 # GNUInstallDirs may choose lib or lib64, so find what was actually written
-# rather than guessing the directory.
-MANIFEST="$(find "$PREFIX" -name VkLayer_lsl_frame.json -print -quit 2>/dev/null || true)"
+# rather than guessing the directory.  Restricted to lsl/layer: a --implicit
+# install leaves a second copy of the manifest in the loader's directory, and
+# this has to keep finding the one the launch-options line points at.
+MANIFEST="$(find "$PREFIX" -path '*/lsl/layer/VkLayer_lsl_frame.json' -print -quit 2>/dev/null || true)"
 if [[ -z "$MANIFEST" ]]; then
   echo "install-layer: the install wrote no manifest under $PREFIX" >&2
   exit 1
@@ -76,16 +88,42 @@ if [[ ! -f "$LIB" ]]; then
   exit 1
 fi
 
-cat <<EOF
-installed:
-  manifest      $MANIFEST
-  library       $LIB
+# The implicit copy is byte-identical -- same layer name, same absolute
+# library_path -- so the only thing that changes is where the loader finds it:
+# a file it scans on its own instead of one a launch line adds.
+IMPLICIT_DIR=
+if [[ "$DO_IMPLICIT" -eq 1 ]]; then
+  IMPLICIT_DIR="$PREFIX/share/vulkan/implicit_layer.d"
+  mkdir -p "$IMPLICIT_DIR"
+  cp "$MANIFEST" "$IMPLICIT_DIR/VkLayer_lsl_frame.json"
+fi
+
+echo "installed:"
+echo "  manifest      $MANIFEST"
+echo "  library       $LIB"
+if [[ -n "$IMPLICIT_DIR" ]]; then
+  echo "  implicit      $IMPLICIT_DIR/VkLayer_lsl_frame.json"
+  cat <<EOF
+
+The loader now finds the layer on its own, so no launch options are needed.  A
+game is upscaled when it is enabled in lsl-gui and Steam starts it -- the layer
+reads SteamAppId and looks it up in the profile store -- and every other Vulkan
+program loads it and does nothing.  Set LSL_LAYER_DISABLE=1 to keep it out
+everywhere.  The launch-options line still works too, and an LSL_LAYER_SCALE in
+it takes precedence over the store:
+EOF
+else
+  cat <<EOF
 
 For one game, this is the launch-options line (lsl-gui writes it for you):
+EOF
+fi
+cat <<EOF
 
   VK_ADD_LAYER_PATH="$LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_LSL_frame LSL_LAYER_SCALE=2 %command%
 
 Unset LSL_LAYER_SCALE (or set it to 1) and the layer loads but does nothing, so
 the line can stay in place while scaling is off.  Remove the install with
-tools/uninstall-layer.sh --prefix "$PREFIX".
+
+  tools/uninstall-layer.sh --prefix "$PREFIX"
 EOF

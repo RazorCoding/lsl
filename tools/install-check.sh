@@ -82,6 +82,31 @@ esac
 echo "manifest ok: ${MANIFEST}"
 echo "  library_path: ${LIB}"
 
+# The other way to install it: --implicit drops a byte-identical copy where the
+# loader scans without being asked, which is what lets the GUI turn a game on
+# with no launch options at all.  The copy has to be there, and it has to be the
+# same manifest -- if the two ever drift, the mode that is supposed to need no
+# configuration is the one nobody tested.
+echo
+echo "installing with --implicit"
+if ! "${ROOT}/tools/install-layer.sh" --prefix "${PREFIX}" --build "${BUILD_ROOT}" \
+       --no-build --implicit >"${TMP}/install-implicit.log" 2>&1; then
+  echo "FAIL: install-layer.sh --implicit failed:" >&2
+  cat "${TMP}/install-implicit.log" >&2
+  exit 1
+fi
+IMPLICIT="${PREFIX}/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json"
+if [[ ! -f "${IMPLICIT}" ]]; then
+  echo "FAIL: --implicit wrote no manifest at ${IMPLICIT}" >&2
+  cat "${TMP}/install-implicit.log" >&2
+  exit 1
+fi
+if ! cmp -s "${IMPLICIT}" "${MANIFEST}"; then
+  echo "FAIL: the implicit manifest is not identical to the installed one" >&2
+  exit 1
+fi
+echo "implicit manifest ok: ${IMPLICIT}"
+
 # The load half: the same byte-for-byte comparison the rest of the suite runs,
 # but pointed at the installed copy instead of the build tree's.
 MODES="${LSL_CHECK_MODES:-fsr1rcas,lanczos2,nis}"
@@ -125,4 +150,17 @@ if grep -q "scale:.*->.*via" "${BROKEN_LOG}" 2>/dev/null; then
 fi
 
 echo "negative control: a manifest with a bad library_path stays unloaded"
-echo "PASS: the installed layer loads and upscales, and only when its path is real"
+
+# And the property the explicit path cannot check: the installed copy also works
+# when the loader finds it on its own and the only thing that says "upscale this"
+# is SteamAppId.  appid-check.sh installs the manifest into a throwaway
+# XDG_DATA_HOME and runs the same enabled/disabled/no-appid controls.
+echo
+echo "running the self-gating checks against the installed copy"
+LSL_LAYER_DIR="${LAYER_DIR}" "${ROOT}/tools/appid-check.sh" "${BUILD_ROOT}"
+status=$?
+if [[ "${status}" -ne 0 ]]; then
+  exit "${status}"
+fi
+
+echo "PASS: the installed layer loads, upscales, and self-gates by appid"

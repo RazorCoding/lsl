@@ -128,6 +128,31 @@ std::string guessLayerDir() {
     return here.empty() ? std::string() : here + "/layer";
 }
 
+// Where the loader looks on its own, in the order it looks, for the layer's
+// implicit manifest.  A file there means the loader loads the layer into every
+// Vulkan process -- no launch options, no Steam restart -- and the layer decides
+// from SteamAppId whether this process is one the profile store enabled.  Empty
+// when there is no such manifest, which is the explicit, launch-options world
+// the window was built for.
+std::string implicitManifestPath() {
+    std::vector<std::string> dirs;
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && *xdg)
+        dirs.push_back(std::string(xdg) + "/vulkan/implicit_layer.d");
+    if (const char* home = std::getenv("HOME"); home && *home)
+        dirs.push_back(std::string(home) +
+                        "/.local/share/vulkan/implicit_layer.d");
+    dirs.push_back("/usr/local/share/vulkan/implicit_layer.d");
+    dirs.push_back("/usr/share/vulkan/implicit_layer.d");
+    dirs.push_back("/etc/vulkan/implicit_layer.d");
+
+    for (const std::string& dir : dirs) {
+        const std::string file = dir + "/VkLayer_lsl_frame.json";
+        std::error_code ec;
+        if (fs::is_regular_file(file, ec)) return file;
+    }
+    return {};
+}
+
 // The method dropdown's contents: "auto" first, then every name in
 // src/method.hpp's table.  Built from the table rather than written out, so a
 // method added there appears in the window too -- and the strings are the same
@@ -171,6 +196,7 @@ private:
     void refreshPreview();
     void refreshBanner();
     void refreshLayerNote();
+    void updateEnableTooltip();
     void setStatus(const std::string& message, bool error);
     void addRow(Gtk::Box& parent, const char* text, Gtk::Widget& widget);
 
@@ -181,6 +207,7 @@ private:
     void setSelectedMethod(const std::string& name);
     void saveProfile();
     bool layerDirLooksRight() const;
+    bool layerIsImplicit() const;
 
     Gtk::SearchEntry* search_ = nullptr;
     Gtk::Switch* hideTools_ = nullptr;
@@ -209,6 +236,9 @@ private:
     std::string steamRoot_;
     std::string configPath_;
     std::string profilePath_;
+    // The loader's own manifest for the layer, if one is installed, so the
+    // window can tell the user that turning a game on here is all it takes.
+    std::string implicitManifest_;
     size_t selected_ = 0;
     bool hasSelection_ = false;
     // Set while widgets are being filled programmatically, so that the change
@@ -460,6 +490,7 @@ void Window::loadSteam() {
     profilePath_ = lsl::defaultProfilePath();
     store_ = lsl::ProfileStore::load(profilePath_);
     if (store_.layer_dir.empty()) store_.layer_dir = guessLayerDir();
+    implicitManifest_ = implicitManifestPath();
     games_ = lsl::steamGames(steamRoot_);
 
     loading_ = true;
@@ -630,9 +661,17 @@ void Window::refreshBanner() {
 
     if (steamRunning()) {
         if (!text.empty()) text += "  ";
-        text += "Steam is running.  It rewrites its configuration files when it "
-                "exits, so anything written here may be lost — restart Steam "
-                "after applying.";
+        // The two ways to enable a game write different things: the implicit
+        // layer needs nothing from Steam at all, while Apply rewrites Steam's
+        // own file, which a running Steam will overwrite on exit.
+        text += layerIsImplicit()
+                    ? "Steam is running.  Turning a game on here takes effect "
+                      "the next time Steam starts it, with no restart.  Only "
+                      "Apply touches Steam's files, and Steam may undo that "
+                      "when it exits."
+                    : "Steam is running.  It rewrites its configuration files "
+                      "when it exits, so anything written here may be lost — "
+                      "restart Steam after applying.";
     }
 
     banner_->set_text(text);
@@ -645,25 +684,61 @@ void Window::refreshBanner() {
 }
 
 void Window::refreshLayerNote() {
-    const bool ok = layerDirLooksRight();
-    layerNote_->set_text(
-        ok ? "VkLayer_lsl_frame.json is there."
-           : "There is no VkLayer_lsl_frame.json in that directory, so the "
-             "layer will not load.  Build the layer target, or correct the "
-             "path above.");
-    if (ok) {
-        layerNote_->remove_css_class("lsl-error");
-        layerNote_->add_css_class("dim-label");
+    std::string note;
+    bool error = false;
+
+    if (layerIsImplicit()) {
+        // The layer loads into every Vulkan process; what decides whether a
+        // given one is upscaled is the profile store, not a launch line.
+        note = "The layer is installed for every Vulkan program (" +
+               implicitManifest_ +
+               ").  Turn a game on here and press Play: the layer reads "
+               "SteamAppId and upscales it.  No launch options needed.";
+    } else if (layerDirLooksRight()) {
+        note = "The layer is installed at " + store_.layer_dir +
+               ", but nothing loads it automatically.  Apply writes it into "
+               "the game's Steam launch options; re-run tools/install-layer.sh "
+               "with --implicit to skip that.";
     } else {
+        note = "The layer directory has no VkLayer_lsl_frame.json, so nothing "
+               "will be upscaled.";
+        error = true;
+    }
+
+    layerNote_->set_text(note);
+    if (error) {
         layerNote_->remove_css_class("dim-label");
         layerNote_->add_css_class("lsl-error");
+    } else {
+        layerNote_->remove_css_class("lsl-error");
+        layerNote_->add_css_class("dim-label");
     }
 
     configNote_->set_text(profilePath_.empty()
                               ? std::string("No home directory, so profiles "
                                             "cannot be saved.")
                               : "Profiles are saved in " + profilePath_ + ".");
+
+    updateEnableTooltip();
 }
+
+// What the enable switch does depends on how the layer got loaded, and the two
+// ways are different enough that one tooltip cannot be honest about both.
+void Window::updateEnableTooltip() {
+    if (layerIsImplicit()) {
+        enable_->set_tooltip_text(
+            "Whether the layer upscales this game.  The layer is installed for "
+            "every Vulkan program, so this switch is all it takes: Steam starts "
+            "the game with its appid in the environment and the layer reads it "
+            "from the saved profile.  No launch options.");
+    } else {
+        enable_->set_tooltip_text(
+            "Whether the profile is enabled for this game.  Nothing reaches "
+            "the game until this is written to the launch options with Apply.");
+    }
+}
+
+bool Window::layerIsImplicit() const { return !implicitManifest_.empty(); }
 
 bool Window::layerDirLooksRight() const {
     return !store_.layer_dir.empty() &&
@@ -729,39 +804,65 @@ void Window::onApplyClicked() {
     std::string message = profile.enabled
                               ? "Applied to " + name + "."
                               : "Removed lsl from " + name + ".";
-    if (profile.enabled && !layerDirLooksRight()) {
+    if (layerIsImplicit() && profile.enabled) {
+        // With an implicit install the launch options are a second way in, not
+        // the way in; say so rather than implying they were required.
+        message += "  This is optional: the layer is already loaded for every "
+                   "program, so the switch above is enough.";
+    } else if (profile.enabled && !layerDirLooksRight()) {
         message += "  The layer directory has no VkLayer_lsl_frame.json, so the "
                    "game will start without upscaling.";
     }
-    if (steamRunning()) {
+    if (steamRunning() && !layerIsImplicit()) {
         message += "  Restart Steam for the change to take effect.";
     }
-    setStatus(message, profile.enabled && !layerDirLooksRight());
+    setStatus(message, profile.enabled && !layerIsImplicit() && !layerDirLooksRight());
 }
 
 void Window::onLaunchClicked() {
     const lsl::SteamGame* game = current();
     if (!game) return;
 
-    if (!layerDirLooksRight()) {
-        setStatus("Launching, but the layer directory has no "
-                  "VkLayer_lsl_frame.json, so nothing will be upscaled.",
-                  true);
+    // Anything that means "this will start without upscaling" is collected here
+    // and reported *after* Steam is asked to start the game: it used to be set
+    // at this point and then overwritten by the "Asked Steam to start" line
+    // below, which made the warning invisible.
+    std::string warning;
+    bool warning_error = false;
+    if (layerIsImplicit()) {
+        // The layer is loaded for every process and reads the profile store, so
+        // there is nothing to apply: just make sure the store says "on".
+        saveProfile();
+        if (!enable_->get_active()) {
+            warning = "it is switched off in its profile, so nothing will be "
+                      "upscaled";
+        }
+    } else if (!layerDirLooksRight()) {
+        warning = "the layer directory has no VkLayer_lsl_frame.json, so "
+                  "nothing will be upscaled";
+        warning_error = true;
     } else if (enable_->get_active()) {
         const std::string existing =
             lsl::steamReadLaunchOptions(configPath_, game->appid);
         double scale = 0.0, sharpness = 0.0;
         std::string method;
         if (!lsl::steamOptionsParse(existing, &scale, &sharpness, &method)) {
-            setStatus("Launching, but this profile has not been applied to "
-                      "Steam's launch options yet — press Apply first.",
-                      true);
+            warning = "this profile has not been applied to Steam's launch "
+                      "options yet, so nothing will be upscaled — press Apply "
+                      "first";
+            warning_error = true;
         }
     }
 
     try {
         Glib::spawn_command_line_async("steam -applaunch " + game->appid);
-        setStatus("Asked Steam to start " + game->name + ".", false);
+        if (warning.empty()) {
+            setStatus("Asked Steam to start " + game->name + ".", false);
+        } else {
+            setStatus("Asked Steam to start " + game->name + ", but " + warning +
+                          ".",
+                      warning_error);
+        }
     } catch (const Glib::Error& error) {
         setStatus(std::string("Could not run Steam: ") + error.what(), true);
     }

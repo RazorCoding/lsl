@@ -10,12 +10,13 @@ methods; packaging landed with it.** Phase 1 is the scaler core and its benchmar
 sharpening to Anime4K's Restore CNN. Phase 2 is a Vulkan layer that makes a
 running application render at a fraction of the surface size and upscales the
 frame at present time with any of them, including `auto`, which picks one per
-swapchain from the render size. Phase 3 is a GTK4 window that writes those
-environment variables into a game's Steam launch options; `tools/install-layer.sh`
-puts the layer where it can stay. What is still not built is frame generation
-(and FSR2/3-style temporal upscaling, which needs motion vectors a present-time
-layer never sees); on a real game the layer is injected by hand or through the
-window.
+swapchain from the render size. Phase 3 is a GTK4 window that remembers a
+per-game profile, and the layer can be enabled in two ways: written into a game's
+Steam launch options, or installed as a Vulkan *implicit* layer that loads itself
+and gates on the `SteamAppId`, so a game upscales from its Play button with no
+launch options and nothing in Steam's configuration. What is still not built is
+frame generation (and FSR2/3-style temporal upscaling, which needs motion vectors
+a present-time layer never sees).
 
 ---
 
@@ -41,6 +42,10 @@ window.
 | `layer/lsl_layer.c` | the Vulkan layer: swapchain capture, the size lie, present interception |
 | `layer/lsl_upscale.c` | the in-layer present engine — every method, plus PPM dumps |
 | `layer/lsl_method.{h,c}` | the layer's C copy of the method names, checked against `src/method.hpp` by `tools/upscale-check.sh` |
+| `layer/lsl_config.{h,c}` | the layer's config resolution (environment over store) and its once-per-process caching |
+| `layer/lsl_profile.{h,c}` | the layer's C reader of the GUI's profile store, keyed by `SteamAppId` |
+| `tests/test_layer_profile.c` | the two above, no GPU needed (`layer-config`) |
+| Implicit layer (self-gating) | **done** — `install-layer.sh --implicit`, gate on `SteamAppId`, `layer-appid` |
 | Validation layers | installable per-user without root; wired into `ctest` |
 | FSR1 `balanced` tier | EASU upscaling **and** RCAS sharpening, both landed |
 | Frame capture / layer injection | **done** — `LSL_LAYER_CAPTURE`, `LSL_LAYER_SCALE` |
@@ -65,17 +70,25 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 ```
 
-CTest runs eight tests: the 111 CPU reference checks (`reference`), 156 checks
+CTest runs eleven tests: the 111 CPU reference checks (`reference`), 156 checks
 over the Steam configuration core (`steam`), a `validation` test that re-runs the
-scaler under the Khronos validation layers, `layer-upscale`, which loads the
-layer into `vkcube` and checks its present-time result against the Phase 1
+scaler under the Khronos validation layers, `layer-config`, which checks the
+layer's own config resolution — the environment over the profile store, and the
+once-per-process caching — without needing a GPU, `layer-store`, which writes a
+profile store with the GUI's own writer and reads it back with the layer's C
+reader (the one seam between the two implementations of that file),
+`layer-upscale`, which loads the layer into `vkcube` and checks its present-time
+result against the Phase 1
 reference (see *Verifying the layer* below), `layer-resize`, which drives the
-layer through recreated swapchains (see *Resizing* below), `layer-install`, which
-installs the layer into a throwaway prefix and checks the *installed* copy loads
-(see *Installing the layer* below), and two GUI selftests (headless
-`gui-selftest`, and `gui-window-selftest`, which builds the window and skips
-itself without a display). The validation-dependent halves **skip themselves**
-unless the layers are installed:
+layer through recreated swapchains (see *Resizing* below), `layer-appid`, which
+installs the layer as an implicit layer in a throwaway `XDG_DATA_HOME` and checks
+it upscales exactly the appids the store enabled (see *Enabling a game without
+launch options* below), `layer-install`, which installs the layer into a
+throwaway prefix and checks the *installed* copy loads (see *Installing the
+layer* below), and two GUI selftests (headless `gui-selftest`, and
+`gui-window-selftest`, which builds the window and skips itself without a
+display). The display-dependent and validation-dependent halves **skip
+themselves** unless the display and the layers are there:
 
 ```sh
 tools/setup-validation-layers.sh     # per-user, no root, ~15 MB
@@ -91,8 +104,16 @@ deliberately *not* a dependency.
 ## Phase 2 — the layer
 
 `build/layer/liblsl-layer.so` does the whole thing inside a running application.
-It is injected through the Steam launch options; the GUI writes these, and this
-is the manual form:
+The layer can be brought in two ways:
+
+* **explicitly**, through the Steam launch options below, which the GUI writes;
+* **implicitly**, as a Vulkan layer the loader finds on its own, which then
+  decides from the `SteamAppId` whether *this* process is a game the GUI enabled
+  — see *Enabling a game without launch options* below. No launch options, and
+  nothing written into Steam's configuration.
+
+The explicit form is the manual one, and what the environment variables below
+mean either way:
 
 ```sh
 VK_ADD_LAYER_PATH=/home/you/Code/lsl/build/layer \
@@ -105,6 +126,8 @@ so the rest of the line can stay while scaling is off.
 
 | Variable | Meaning |
 | --- | --- |
+| `LSL_LAYER_DISABLE` | anything non-zero keeps the layer out of the process entirely, in either mode |
+| `LSL_PROFILES` | where the profile store is, for the implicit mode (default `$XDG_CONFIG_HOME/lsl/profiles.conf`, then `$HOME/.config/lsl/profiles.conf`) |
 | `LSL_LAYER_SCALE` | upscale factor, `2` = render at half size. Unset/`≤1` = off. Fractional values work (`1.5`, `2.5`); the app is told `trunc(real/scale)` |
 | `LSL_LAYER_SHARPNESS` | RCAS strength in stops, as in `lsl-upscale` (default 0 = AMD's setting). Only `fsr1rcas` reads it |
 | `LSL_LAYER_MODE` | which method to run: `nearest`, `bilinear`, `cubic`, `lanczos2`, `lanczos3`, `fsr1`, `fsr1rcas`, `nis`, `cnn`, or `auto`. Unset/empty = `fsr1rcas`; an unknown name logs a warning and uses `fsr1rcas` |
@@ -122,8 +145,9 @@ object and a manifest that names it **absolutely** into a prefix instead —
 `~/.local` by default, no root:
 
 ```sh
-./tools/install-layer.sh                  # into ~/.local
+./tools/install-layer.sh                  # into ~/.local, launch-options mode
 ./tools/install-layer.sh --prefix /opt/lsl
+./tools/install-layer.sh --implicit       # also load it everywhere, self-gating
 ```
 
 It prints the exact launch line for that prefix, and `tools/uninstall-layer.sh`
@@ -131,12 +155,15 @@ removes it again. The layout is `<prefix>/lib/lsl/layer/` holding
 `liblsl-layer.so` and `VkLayer_lsl_frame.json` — the same shape as `build/layer`,
 so the GUI's directory check and `LSL_LAYER_DIR` accept either.
 
+Without `--implicit` the manifest goes only there, and the launch line is what
+loads it. With `--implicit` a byte-identical copy is also written to
+`<prefix>/share/vulkan/implicit_layer.d/VkLayer_lsl_frame.json`, which is one of
+the directories the loader scans unprompted, so every Vulkan process loads the
+layer and the profile store decides what to do. Both copies are the same file, so
+there is no second manifest to drift: `tools/install-check.sh` checks that.
+
 Two things are deliberate:
 
-* **It is not installed where the loader scans automatically.** The manifest does
-  not go under `vulkan/implicit_layer.d`, because the layer is enabled per game,
-  not for every Vulkan application on the machine. The launch line already sets
-  `VK_ADD_LAYER_PATH`, which is all a per-game layer needs.
 * **The manifest is written at install time.** `library_path` has to be absolute
   — the loader does not resolve it against the manifest's own directory, the same
   trap that stops the packaged `lsfg-vk` layer from loading (see *Validation
@@ -144,6 +171,78 @@ Two things are deliberate:
   installed manifest is generated by `cmake --install`, after `--prefix` is
   known, and `tools/install-check.sh` fails if the path is relative, points at
   nothing, or the installed copy does not actually load.
+* **The implicit manifest carries a `disable_environment`.** The loader refuses
+  to load an implicit layer whose manifest does not name a variable that turns it
+  off, so the manifest sets `{"LSL_LAYER_DISABLE": "1"}`. Setting that variable
+  keeps the layer out of every process; it is also the layer's own off switch, and
+  the profile store's per-game `enabled` flag is the normal one.
+
+### Enabling a game without launch options
+
+Writing launch options means touching Steam's `localconfig.vdf`, restarting Steam
+for the change to be seen, and leaving `LSL_*` strings in a game's configuration.
+`--implicit` avoids all of it:
+
+```sh
+./tools/install-layer.sh --implicit       # once, into ~/.local
+# then, in the window: turn the game on, press Steam's Play button
+```
+
+No launch options are written, nothing in Steam's configuration changes, and
+Steam does not need restarting. The chain is:
+
+1. the loader loads `VK_LAYER_LSL_frame` into the game's Vulkan process because
+   it found the manifest itself;
+2. the layer reads the `SteamAppId` Steam puts in a game's environment (falling
+   back to `SteamGameId`, which is what some shortcuts set) and looks it up in
+   `~/.config/lsl/profiles.conf`, the same store the window writes;
+3. a record whose `enabled` token is `1` becomes a scale, a sharpness and a
+   method; anything else — no record, a disabled one, an unparsable one — and the
+   layer does nothing. A process that is not a game has no `SteamAppId` at all,
+   so it never gets that far.
+
+The resolution order is fixed and shortest-proof-first, and the layer records
+which one applied in its log (`scale: appid 933110 is enabled in
+/home/you/.config/lsl/profiles.conf`):
+
+| order | source | effect |
+| --- | --- | --- |
+| 1 | `LSL_LAYER_DISABLE` set and non-zero | off, and the loader does not even load it |
+| 2 | `LSL_LAYER_SCALE` set | that scale, whatever the profile store says — so an explicit launch line still wins |
+| 3 | the profile store, by `SteamAppId`/`SteamGameId` | the GUI's per-game setting |
+| 4 | nothing | off |
+
+`LSL_LAYER_SCALE` sitting above the store is what keeps the launch-options mode
+authoritative when both are present; the store is a fallback for a process that
+was started without one. The store is read once per process, so a game that
+starts a second process (a launcher, then the engine) reads it the same way in
+both, and the paths it searches are `$LSL_PROFILES`, then
+`$XDG_CONFIG_HOME/lsl/profiles.conf`, then the same under `$HOME`.
+
+`layer-appid` is that whole chain as a test: it installs the manifest into a
+throwaway `XDG_DATA_HOME` and runs `vkcube` with `SteamAppId` set to a game the
+store enables, one the store disables, one the store never heard of, none at all,
+and once with `LSL_LAYER_DISABLE=1`. Only the first upscales, and the upscaled
+frame is compared against `lsl-upscale` byte for byte. `layer-config` checks the
+resolution order and the caching without a GPU at all.
+
+One thing to know when combining the two modes: implicit layers sit closer to the
+application than layers asked for explicitly, and among implicit layers the one
+the loader finds first sits closest. A user's install under `~/.local/share`
+is searched before `/usr/share`, so an implicit lsl ends up *above* a
+system-installed frame-generation layer such as `lsfg-vk` in the chain. They
+compose in the ordinary case — lsl enlarges the swapchain before it is presented,
+and frame generation runs at present — but a frame-generation layer that fails at
+swapchain creation now fails the swapchain lsl built, which shows up as lsl's own
+"creating a NxM swapchain failed" retry line. `DISABLE_LSFGVK` (or the equivalent
+for whichever layer) keeps that layer out of the way.
+
+This is worth being precise about because it is easy to misdiagnose: the failure
+looks like lsl's own, and in the test suite it turned out to be a red herring —
+`appid-check.sh` originally redirected `HOME` to isolate the install, which broke
+the *other* layer's own data path, and only a run with the real `HOME` and a
+throwaway `XDG_DATA_HOME` showed the two layers coexisting. The test now does the
+latter.
 
 ### How the lie works
 
@@ -407,14 +506,23 @@ in the right place.
 
 ## Phase 3 — the GUI
 
-`lsl-gui` (GTK4) is a writer of one string. The layer's whole interface is
-`VK_ADD_LAYER_PATH` plus `LSL_LAYER_SCALE`, `LSL_LAYER_SHARPNESS` and
+`lsl-gui` (GTK4) is a writer of one string. In the explicit mode the layer's whole
+interface is `VK_ADD_LAYER_PATH` plus `LSL_LAYER_SCALE`, `LSL_LAYER_SHARPNESS` and
 `LSL_LAYER_MODE` in a game's launch options, so the window's job is to remember a
 per-game profile and splice that line into `localconfig.vdf`:
 
 ```
 ./build/lsl-gui            # or --selftest / --selftest-window, see below
 ```
+
+In the implicit mode (`install-layer.sh --implicit`) there is no string to write:
+the window's job is still to remember the profile, and the layer reads the same
+store itself, so turning a game on in the window is all it takes. The window
+detects the manifest in the loader's implicit directories and changes what it
+says accordingly — the note under the layer path, the enable switch's tooltip,
+the banner about a running Steam (only *Apply* still touches Steam's files), and
+the launch button, which no longer insists the profile be applied first. Apply
+still works in that mode; it is just a second way in, and the window says so.
 
 The split matters more than the window does. Everything that decides *what* to
 write — Steam root discovery, library and manifest parsing, the in-place VDF
@@ -448,9 +556,11 @@ Three properties are deliberate:
 * **After a write the line is re-read from the file.** The "In Steam right now"
   box shows what Steam will actually do, not what lsl intended.
 * **Steam is never guessed about.** If Steam is running, the window says so —
-  Steam rewrites `localconfig.vdf` when it exits, so a write made while it runs
-  is likely to be lost — and the launch button warns when a profile has not been
-  applied yet.
+  Steam rewrites `localconfig.vdf` when it exits, so an *Apply* made while it runs
+  is likely to be lost. In the implicit mode the per-game flag lives in lsl's own
+  profile store rather than in Steam's file, so turning a game on takes effect the
+  next time Steam starts it and the launch button no longer insists the profile be
+  applied first; in the explicit mode it still does.
 
 Two known limits:
 
@@ -991,6 +1101,11 @@ and review — not on the layer.
      `appmanifest_*.acf`, a per-game profile, the launch-options line written
      into `localconfig.vdf`, and a launch button. Its packaging half is also
      done — see *Installing the layer*.
+   * ~~**No launch options at all**~~ — **done**, see *Enabling a game without
+     launch options*: `tools/install-layer.sh --implicit` puts the manifest where
+     the loader scans, the layer resolves the scale from `SteamAppId` against the
+     GUI's profile store (the environment still wins), and `layer-appid` pins the
+     whole chain down against a byte-exact reference.
    * ~~**More methods, and `auto`**~~ — **done**, see *Methods* above: `lanczos3`,
      `nis` and Anime4K v4's Restore CNN (`cnn`), selected by `LSL_LAYER_MODE`,
      with `auto` resolving from geometry. Licensing matches the existing
@@ -1009,7 +1124,9 @@ layer/lsl_layer.c         the layer: the size lie, swapchain capture, present in
 layer/lsl_upscale.c       the in-layer present engine: every method, auto, PPM dumps
 layer/lsl_layer.h         shared layer/engine state, per-device function tables
 layer/lsl_method.{h,c}    the layer's C copy of the method vocabulary (src/method.hpp is C++)
-layer/VkLayer_lsl_frame.json  layer manifest, loaded per game
+layer/lsl_config.{h,c}    the layer's config resolution: environment, then the store
+layer/lsl_profile.{h,c}   the layer's C reader of the per-game profile store
+layer/VkLayer_lsl_frame.json  layer manifest, loaded per game (or implicitly, self-gating)
 shaders/scale.comp        GLSL compute scaler (nearest/bilinear/cubic/lanczos2/lanczos3/EASU)
 shaders/rcas.comp         GLSL compute sharpener — FSR1's RCAS, a second dispatch
 shaders/nis.comp          GLSL compute sharpener — NIS's, written for the buffer model
@@ -1023,6 +1140,8 @@ gui/main.cpp             lsl-gui: the GTK4 window (optional target)
 src/steam.{hpp,cpp}       Steam discovery, in-place VDF edit, launch-options merge
 src/profile.{hpp,cpp}     the per-game profile store (plain text, atomic writes)
 tests/test_steam.cpp      the above, tested without a display
+tests/test_layer_profile.c  the layer's config/profile resolution, tested without a GPU
+tests/test_layer_store.cpp  the GUI's store writer and the layer's reader, in one process
 src/reference.*           CPU filters, box downsampler, PSNR/SSIM, edge energy
 src/fsr1_ref.cpp          CPU FSR1 EASU + RCAS; compiles the vendored header via a shim
 src/nis_ref.*             CPU reference for the NIS sharpening pass
@@ -1035,6 +1154,10 @@ tools/embed_spv.py        SPIR-V -> C++ array
 tools/ffx_cpp_shim.py     GLSL 'inout'/'out' params -> C++ references
 tools/anime4k_weights.py  bake Anime4K's weights into a header the layer and CLI share
 tools/upscale-check.sh            layer gate: every method, pixel match + validation + self-test
+tools/appid-check.sh              implicit-layer gate: self-gating by SteamAppId, byte match
+tools/install-layer.sh            install the layer into a prefix (--implicit: load it everywhere)
+tools/uninstall-layer.sh          remove either install
+tools/install-check.sh            install gate: the installed copy loads, upscales and self-gates
 tools/ppm_tool.py                 PPM compare (bytes / max delta / PSNR) and swap
 tools/setup-validation-layers.sh   per-user validation layer install (no root)
 tools/with-validation.sh          run a command with validation forced on

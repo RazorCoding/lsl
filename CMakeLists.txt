@@ -161,6 +161,30 @@ target_link_libraries(lsl-tests PRIVATE lsl_core)
 add_executable(lsl-steam-tests tests/test_steam.cpp)
 target_link_libraries(lsl-steam-tests PRIVATE lsl_steam)
 
+# The layer's two configuration files, built and run as a normal program rather
+# than through the shared object, so a failure names the function at fault.  The
+# layer is C, so this is: it links the sources directly.
+add_executable(lsl-layer-tests
+  tests/test_layer_profile.c
+  layer/lsl_config.c
+  layer/lsl_profile.c
+  layer/lsl_method.c)
+target_include_directories(lsl-layer-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/layer)
+target_compile_options(lsl-layer-tests PRIVATE -Wall -Wextra)
+
+# The seam between the two implementations of the profile store: the GUI's C++
+# writer and the layer's C reader.  This one links both, so it is C++ rather
+# than C, and it is the only test that puts "the window saved this" next to "the
+# layer read this".
+add_executable(lsl-layer-store-tests
+  tests/test_layer_store.cpp
+  layer/lsl_config.c
+  layer/lsl_profile.c
+  layer/lsl_method.c)
+target_include_directories(lsl-layer-store-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/layer)
+target_link_libraries(lsl-layer-store-tests PRIVATE lsl_steam)
+target_compile_options(lsl-layer-store-tests PRIVATE -Wall -Wextra)
+
 # ---------------------------------------------------------------------------
 # GUI (optional)
 #
@@ -194,7 +218,8 @@ endif()
 # the surface size and upscales the smaller frame it renders back to full
 # resolution with the Phase 1 FSR1 chain.
 # ---------------------------------------------------------------------------
-add_library(lsl-layer SHARED layer/lsl_layer.c layer/lsl_upscale.c layer/lsl_method.c ${LSL_BLOB_C})
+add_library(lsl-layer SHARED layer/lsl_layer.c layer/lsl_upscale.c layer/lsl_method.c
+                          layer/lsl_config.c layer/lsl_profile.c ${LSL_BLOB_C})
 target_link_libraries(lsl-layer PRIVATE Vulkan::Vulkan)
 # -g unconditionally: when this layer misbehaves, the only useful evidence is a
 # core dump, and a backtrace without line numbers costs far more than the
@@ -226,6 +251,15 @@ add_test(NAME reference COMMAND lsl-tests)
 # files, so it runs anywhere.
 add_test(NAME steam COMMAND lsl-steam-tests)
 
+# The layer's per-game configuration: reading the GUI's profile store and
+# deciding, from SteamAppId, whether this process is one of the games it names.
+# No display and no GPU, so it runs everywhere.
+add_test(NAME layer-config COMMAND lsl-layer-tests)
+
+# The same seam from the other side: a store written by the GUI's own writer,
+# read back by the layer's C parser.  No display and no GPU either.
+add_test(NAME layer-store COMMAND lsl-layer-store-tests)
+
 # Runs the scaler under the Khronos validation layer and fails on any validation
 # error.  Skips itself when the layers are absent (tools/setup-validation-layers.sh).
 add_test(NAME validation
@@ -256,6 +290,16 @@ add_test(NAME layer-resize
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/resize-check.sh
                  ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(layer-resize PROPERTIES SKIP_RETURN_CODE 77)
+
+# The implicit path: the layer is found by the loader on its own and decides from
+# SteamAppId whether this process is a game the GUI enabled.  Nothing is passed
+# through launch options, and the negative controls prove the layer is loaded but
+# silent for everything else -- which is the property that makes it safe to put
+# in the loader's own search path.  Skips (77) without a display.
+add_test(NAME layer-appid
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/appid-check.sh
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(layer-appid PROPERTIES SKIP_RETURN_CODE 77)
 
 # The GUI's launch-options logic, checked against whatever Steam installation
 # this machine actually has: every game is put through an apply/clear round
